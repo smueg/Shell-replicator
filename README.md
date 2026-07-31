@@ -15,9 +15,9 @@ exclude-pattern loading for its default location and file format)_.
 
 ### Adaptive JOBS:
 
-Start from whatever the previous run decided worked well.
+1. Start from whatever the previous run decided worked well.
 
-JOBS_DEFAULT above is only used the very first time (no history yet).
+2. JOBS_DEFAULT above is only used the very first time (no history yet).
 
 _See the adaptation logic near the end of the script for how this updates_.
 
@@ -31,14 +31,14 @@ One real TCP+auth handshake, reused by the preflight check, every worker's rsync
 
 ### Cleanup:
 
-only scrub working files when the run was fully successful.
+1. Only scrub working files when the run was fully successful.
 
-Always removes pure plumbing (progress FIFO, empty fail-marker dir).
+2. Always removes pure plumbing (progress FIFO, empty fail-marker dir).
 
 ---
 
 ### Build file list:
 
-Regular files, directories (incl. empty), and symlinks, so new files AND new/empty directories are always replicated.
+1. Regular files, directories (incl. empty), and symlinks, so new files AND new/empty directories are always replicated.
 
-Captures mtime too, so the destination comparison below can tell which files are actually new/changed versus already in sync.
+2. Captures mtime too, so the destination comparison below can tell which files are actually new/changed versus already in sync.
