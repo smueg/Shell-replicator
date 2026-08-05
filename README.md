@@ -64,13 +64,13 @@ excluded. Each entry is normalized into one of three matching behaviors:
    a warning).
    ```yaml
    - build/cache
-   - /home/user/Staging/foo/logs
+   - /home/user/foo/logs
    ```
 3. **A path ending in `/*`** — excludes only the _contents_ of that
    directory; the directory itself is still created/replicated (empty)
    on the destination.
    ```yaml
-   - /home/user/Staging/some-folder/*
+   - /home/user/foo/some-folder/*
    ```
 
 A trailing single `/` (no wildcard) is stripped automatically, so
