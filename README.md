@@ -111,6 +111,7 @@ _See the adaptation logic near the end of the script for how this updates_.
 ### Log files (written under `TMP`; Override Path to `~/some-folder`)
 
 **Override provided in ~/Replicator-Settings/replicator-config.yaml**
+
 Specifying "log_dir:"
 
 Every run is stamped with `RUN_TS` (e.g. `20260805-142301`), so filenames
