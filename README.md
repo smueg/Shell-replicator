@@ -92,6 +92,22 @@ natively, with no JSON conversion or `jq`/`yq` dependency involved.
 
 ---
 
+### SSH connection multiplexing:
+
+One real TCP+auth handshake, reused by the preflight check, every worker's rsync, and the replication-propagation calls. ControlPath must stay short (AF_UNIX socket path limit is 108 bytes) — deliberately anchored under /tmp rather than TMP, since TMP is user-configurable and could easily be deep enough to blow that limit (breaking every single SSH connection outright if it did).
+
+---
+
+### Adaptive JOBS:
+
+1. Start from whatever the previous run decided worked well.
+
+2. JOBS_DEFAULT above is only used the very first time (no history yet).
+
+_See the adaptation logic near the end of the script for how this updates_.
+
+---
+
 ### Log files (written under `TMP`, default `/home/steffen/Rsync-logs`)
 
 Every run is stamped with `RUN_TS` (e.g. `20260805-142301`), so filenames
@@ -119,22 +135,6 @@ logs — never worth keeping): `src_listing_<RUN_TS>.txt`,
 
 **Persists across runs, never cleaned up:** `.jobs_state` — the adaptive
 JOBS history (see below), not scoped to a single `RUN_TS`.
-
----
-
-### Adaptive JOBS:
-
-1. Start from whatever the previous run decided worked well.
-
-2. JOBS_DEFAULT above is only used the very first time (no history yet).
-
-_See the adaptation logic near the end of the script for how this updates_.
-
----
-
-### SSH connection multiplexing:
-
-One real TCP+auth handshake, reused by the preflight check, every worker's rsync, and the replication-propagation calls. ControlPath must stay short (AF_UNIX socket path limit is 108 bytes) — deliberately anchored under /tmp rather than TMP, since TMP is user-configurable and could easily be deep enough to blow that limit (breaking every single SSH connection outright if it did).
 
 ---
 
