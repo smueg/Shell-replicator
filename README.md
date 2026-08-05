@@ -31,16 +31,16 @@ applies) and each has its own override env var (`REPLICATOR_CONFIG`,
 #### `replicator-config.yaml` — destination connection settings + log dir
 
 ```yaml
-dest_host: 157.245.13.145
-dest_user: steffen
-ssh_port: 2222
-log_dir: /home/steffen/Rsync-logs # optional; same as setting TMP
+dest_host: 8.1.2.3
+dest_user: user
+ssh_port: 22
+log_dir: /home/user/Rsync-logs # optional; same as setting TMP
 ```
 
 `dest_host`, `dest_user`, and `ssh_port` are required (via this file or the
 matching env vars). `log_dir` is optional — it can also be set via the `TMP`
 environment variable (which takes precedence over the file), falling back
-to `/home/steffen/Rsync-logs` if neither is set.
+to `/home/user/Rsync-logs` if neither is set.
 
 Any of these can also be set as environment variables (`DEST_HOST`,
 `DEST_USER`, `SSH_PORT`, `TMP`), which take precedence over the config file.
@@ -64,13 +64,13 @@ excluded. Each entry is normalized into one of three matching behaviors:
    a warning).
    ```yaml
    - build/cache
-   - /home/steffen/Projects/foo/logs
+   - /home/user/Staging/foo/logs
    ```
 3. **A path ending in `/*`** — excludes only the _contents_ of that
    directory; the directory itself is still created/replicated (empty)
    on the destination.
    ```yaml
-   - /home/steffen/Projects/Docker-images/*
+   - /home/user/Staging/some-folder/*
    ```
 
 A trailing single `/` (no wildcard) is stripped automatically, so
@@ -108,7 +108,10 @@ _See the adaptation logic near the end of the script for how this updates_.
 
 ---
 
-### Log files (written under `TMP`, default `/home/steffen/Rsync-logs`)
+### Log files (written under `TMP`; Override Path to `~/some-folder`)
+
+**Override provided in ~/Replicator-Settings/replicator-config.yaml**
+Specifying "log_dir:"
 
 Every run is stamped with `RUN_TS` (e.g. `20260805-142301`), so filenames
 below never collide across runs.
