@@ -34,7 +34,7 @@ applies) and each has its own override env var (`REPLICATOR_CONFIG`,
 dest_host: 8.1.2.3
 dest_user: user
 ssh_port: 22
-log_dir: ~/Replicator-Logs # optional path; same as setting TMP
+log_dir: ~/Replicator-Logs # optional path override; same as setting TMP
 ```
 
 `dest_host`, `dest_user`, and `ssh_port` are required (via this file or the
