@@ -6,10 +6,111 @@
 
 Usage: replicator.sh SRC_DIR DEST_DIR
 
-Overridable via environment: TMP, RUN*TS, EXCLUDE_FILE *(see below near the
-exclude-pattern loading for its default location and file format)\_.
+Overridable via environment: TMP, RUN_TS, EXCLUDE_FILE, REPLICATOR_CONFIG,
+REPLICATOR_SETTINGS_DIR
+_(see below for default locations and file formats)_.
 
 ---
+
+### Settings directory (`~/Replicator-Settings/` by default, override with `REPLICATOR_SETTINGS_DIR`)
+
+All external settings are plain YAML files kept together in one directory
+for easy maintenance (out of the script and out of git):
+
+```
+~/Replicator-Settings/
+├── replicator-config.yaml     # destination connection settings + log dir
+└── replicator-excludes.yaml   # exclude patterns
+```
+
+Each file is independently opt-in (missing file = that setting's default
+applies) and each has its own override env var (`REPLICATOR_CONFIG`,
+`EXCLUDE_FILE`) if you want to point it somewhere else entirely, outside
+`REPLICATOR_SETTINGS_DIR`.
+
+#### `replicator-config.yaml` — destination connection settings + log dir
+
+```yaml
+dest_host: 157.245.13.145
+dest_user: steffen
+ssh_port: 2222
+log_dir: /home/steffen/Rsync-logs # optional; same as setting TMP
+```
+
+`dest_host`, `dest_user`, and `ssh_port` are required (via this file or the
+matching env vars). `log_dir` is optional — it can also be set via the `TMP`
+environment variable (which takes precedence over the file), falling back
+to `/home/steffen/Rsync-logs` if neither is set.
+
+Any of these can also be set as environment variables (`DEST_HOST`,
+`DEST_USER`, `SSH_PORT`, `TMP`), which take precedence over the config file.
+
+#### `replicator-excludes.yaml` — exclude patterns
+
+A YAML list of strings, opt-in — if the file doesn't exist, nothing is
+excluded. Each entry is normalized into one of three matching behaviors:
+
+1. **Bare name** (no `/`) — matches that name at *any depth* in the tree,
+   file or directory alike (same as `find -name`).
+   ```yaml
+   - node_modules
+   - .DS_Store
+   ```
+2. **A path** (contains `/`, no trailing `/*`) — anchored to `SRC_DIR`,
+   excludes that exact file/directory *and*, for a directory, everything
+   beneath it. Can be relative to `SRC_DIR`, or absolute as long as it
+   falls under `SRC_DIR` (the prefix is stripped automatically; an
+   absolute path outside `SRC_DIR` can never match and is rejected with
+   a warning).
+   ```yaml
+   - build/cache
+   - /home/steffen/Projects/foo/logs
+   ```
+3. **A path ending in `/*`** — excludes only the *contents* of that
+   directory; the directory itself is still created/replicated (empty)
+   on the destination.
+   ```yaml
+   - /home/steffen/Projects/Docker-images/*
+   ```
+
+A trailing single `/` (no wildcard) is stripped automatically, so
+`Rsync-Test/` behaves like case 2 above. A pattern of exactly `*` or `**`
+triggers a runtime warning since it would likely exclude the whole tree.
+Leading `!` negation (a gitignore habit) is **not** supported — such an
+entry is skipped with a warning rather than silently mistreated.
+
+Both files require `python3` with PyYAML installed — YAML is parsed
+natively, with no JSON conversion or `jq`/`yq` dependency involved.
+
+---
+
+### Log files (written under `TMP`, default `/home/steffen/Rsync-logs`)
+
+Every run is stamped with `RUN_TS` (e.g. `20260805-142301`), so filenames
+below never collide across runs.
+
+**Always written, kept regardless of outcome:**
+
+- `replicator_parallel_<RUN_TS>.log` — the main run log (`$LOG`): info/ok/warn/fail
+  lines, retries, per-chunk OK/FAIL summaries.
+- `replicator_summary_<RUN_TS>.tsv` — one row per chunk (`$SUMMARY_TXT`):
+  exit code, bytes/files transferred, changed vs. already-in-sync counts.
+
+**Kept only if the run fails** (any worker failure, or non-empty stderr);
+deleted automatically on a fully successful run:
+
+- `replicator_parallel_error_<RUN_TS>.log` — captured stderr (`$ERR_LOG`).
+- `worker_<RUN_TS>_W*.log` — one log per parallel worker.
+- `files_<RUN_TS>.txt` and `chunk_<RUN_TS>_*` — the full file list and its
+  per-worker chunks.
+
+**Always deleted at the end of the run** (transient working files, not
+logs — never worth keeping): `src_listing_<RUN_TS>.txt`,
+`dest_listing_<RUN_TS>.txt`, `toadd_<RUN_TS>.txt`,
+`extraneous_<RUN_TS>.txt`, `progress_<RUN_TS>.fifo`.
+
+**Persists across runs, never cleaned up:** `.jobs_state` — the adaptive
+JOBS history (see below), not scoped to a single `RUN_TS`.
 
 ---
 

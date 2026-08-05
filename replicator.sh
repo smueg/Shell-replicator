@@ -5,9 +5,9 @@ set -euo pipefail
 # Parallel rsync-over-SSH replication tool
 # Usage: replicator.sh SRC_DIR DEST_DIR
 #
-# Overridable via environment: TMP, RUN_TS, EXCLUDE_FILE, REPLICATOR_CONFIG
-# (see below near the relevant loading logic for default locations and file
-# formats).
+# Overridable via environment: TMP, RUN_TS, EXCLUDE_FILE, REPLICATOR_CONFIG,
+# REPLICATOR_SETTINGS_DIR (see below near the relevant loading logic for
+# default locations and file formats).
 # ============================================================================
 
 SRC_DIR="${1:-}"
@@ -20,29 +20,98 @@ fi
 [[ -d "$SRC_DIR" ]] || { echo "SRC_DIR is not a directory: $SRC_DIR" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# Destination connection settings: kept out of the script (and out of git)
-# in a JSON file in the home directory, same "opt-in dotfile" pattern as
-# EXCLUDE_FILE below. Parsed with jq. Format:
-#   {
-#     "dest_host": "157.245.13.145",
-#     "dest_user": "steffen",
-#     "ssh_port": 2222
-#   }
+# YAML loading helpers: shared by REPLICATOR_CONFIG and EXCLUDE_FILE below.
+# Read and validated with python3+PyYAML directly — no
+# JSON intermediate representation and no `jq`/`yq` dependency anywhere in
+# the pipeline.
+#
+# yaml_read_mapping FILE KEY [KEY ...]
+#   Validates FILE parses as a YAML mapping, then prints each requested
+#   key's value on its own line (blank line for a missing/null key), in
+#   the order given. A YAML syntax error, or FILE not being a mapping,
+#   prints a message to stderr and exits non-zero.
+#
+# yaml_read_list FILE
+#   Validates FILE parses as a YAML list of strings, then prints each
+#   element on its own line. Same error handling as above.
+# ---------------------------------------------------------------------------
+yaml_read_mapping() {
+  local file="$1"; shift
+  python3 - "$file" "$@" <<'PYEOF'
+import sys, yaml
+
+path = sys.argv[1]
+keys = sys.argv[2:]
+try:
+    with open(path) as f:
+        data = yaml.safe_load(f)
+except yaml.YAMLError as e:
+    print(f"YAML parse error in {path}: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if data is None:
+    data = {}
+if not isinstance(data, dict):
+    print(f"{path} must be a YAML mapping (key: value pairs)", file=sys.stderr)
+    sys.exit(1)
+
+for k in keys:
+    v = data.get(k)
+    print("" if v is None else v)
+PYEOF
+}
+
+yaml_read_list() {
+  local file="$1"
+  python3 - "$file" <<'PYEOF'
+import sys, yaml
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        data = yaml.safe_load(f)
+except yaml.YAMLError as e:
+    print(f"YAML parse error in {path}: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if data is None:
+    data = []
+if not isinstance(data, list) or not all(isinstance(x, str) for x in data):
+    print(f"{path} must be a YAML list of strings", file=sys.stderr)
+    sys.exit(1)
+
+for item in data:
+    print(item)
+PYEOF
+}
+
+# ---------------------------------------------------------------------------
+# All external settings (this file, EXCLUDE_FILE below) live together in
+# $HOME/Replicator-Settings/ for easy maintenance — kept out of the script
+# (and out of git), same "opt-in" pattern as before. Format:
+#   dest_host: 157.245.13.145
+#   dest_user: steffen
+#   ssh_port: 2222
+#   log_dir: /home/steffen/Rsync-logs   # optional; see TMP below
 # Env vars, if already set when the script is invoked, take precedence over
 # the config file (config file only fills in what isn't already set).
 # ---------------------------------------------------------------------------
-REPLICATOR_CONFIG="${REPLICATOR_CONFIG:-$HOME/.replicator.conf.json}"
+REPLICATOR_SETTINGS_DIR="${REPLICATOR_SETTINGS_DIR:-$HOME/Replicator-Settings}"
+REPLICATOR_CONFIG="${REPLICATOR_CONFIG:-$REPLICATOR_SETTINGS_DIR/replicator-config.yaml}"
 if [[ -f "$REPLICATOR_CONFIG" ]]; then
-  command -v jq >/dev/null 2>&1 || { echo "jq is required to read $REPLICATOR_CONFIG but is not installed." >&2; exit 1; }
-  jq -e . "$REPLICATOR_CONFIG" >/dev/null 2>&1 || { echo "Config file is not valid JSON: $REPLICATOR_CONFIG" >&2; exit 1; }
+  command -v python3 >/dev/null 2>&1 || { echo "python3 (with PyYAML) is required to read $REPLICATOR_CONFIG but is not installed." >&2; exit 1; }
 
-  CONF_DEST_HOST="$(jq -r '.dest_host // empty' "$REPLICATOR_CONFIG")"
-  CONF_DEST_USER="$(jq -r '.dest_user // empty' "$REPLICATOR_CONFIG")"
-  CONF_SSH_PORT="$(jq -r '.ssh_port // empty' "$REPLICATOR_CONFIG")"
+  CONFIG_VALS="$(yaml_read_mapping "$REPLICATOR_CONFIG" dest_host dest_user ssh_port log_dir)" || exit 1
+  mapfile -t CONFIG_VALS_ARR <<<"$CONFIG_VALS"
+  CONF_DEST_HOST="${CONFIG_VALS_ARR[0]:-}"
+  CONF_DEST_USER="${CONFIG_VALS_ARR[1]:-}"
+  CONF_SSH_PORT="${CONFIG_VALS_ARR[2]:-}"
+  CONF_LOG_DIR="${CONFIG_VALS_ARR[3]:-}"
 
   DEST_HOST="${DEST_HOST:-$CONF_DEST_HOST}"
   DEST_USER="${DEST_USER:-$CONF_DEST_USER}"
   SSH_PORT="${SSH_PORT:-$CONF_SSH_PORT}"
+  TMP="${TMP:-$CONF_LOG_DIR}"
 fi
 
 DEST_HOST="${DEST_HOST:-}"
@@ -52,11 +121,9 @@ SSH_PORT="${SSH_PORT:-}"
 if [[ -z "$DEST_HOST" || -z "$DEST_USER" || -z "$SSH_PORT" ]]; then
   echo "Missing DEST_HOST, DEST_USER, and/or SSH_PORT." >&2
   echo "Set them in $REPLICATOR_CONFIG (or export as environment variables). Example:" >&2
-  echo '  {' >&2
-  echo '    "dest_host": "157.245.13.145",' >&2
-  echo '    "dest_user": "steffen",' >&2
-  echo '    "ssh_port": 2222' >&2
-  echo '  }' >&2
+  echo '  dest_host: 157.245.13.145' >&2
+  echo '  dest_user: steffen' >&2
+  echo '  ssh_port: 2222' >&2
   exit 1
 fi
 
@@ -67,13 +134,15 @@ JOBS_MAX=16
 # scanned (see below) — sized relative to JOBS_MAX so chunk count never
 # becomes the bottleneck on concurrency.
 
+# Log/working-file directory: env TMP wins if already set, else log_dir
+# from REPLICATOR_CONFIG (loaded above), else this hardcoded fallback.
 TMP="${TMP:-/home/steffen/Rsync-logs}"
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
 
-# Exclude patterns: a JSON file in the home directory (not tied to wherever
-# the script itself lives), opt-in — absence of this file means zero
-# exclusions. See load_exclude_patterns() below for the format.
-EXCLUDE_FILE="${EXCLUDE_FILE:-$HOME/.replicator-excludes.json}"
+# Exclude patterns: a YAML file in REPLICATOR_SETTINGS_DIR (not tied to
+# wherever the script itself lives), opt-in — absence of this file means
+# zero exclusions. See load_exclude_patterns() below for the format.
+EXCLUDE_FILE="${EXCLUDE_FILE:-$REPLICATOR_SETTINGS_DIR/replicator-excludes.yaml}"
 
 # Used both for the exclude-pattern report and the add/remove name listings
 # further down.
@@ -105,11 +174,11 @@ SSH_CTL_PATH="/tmp/.rsync-ssh-cm-%C"
 SSH_CTL_OPTS="-o ControlMaster=auto -o ControlPersist=120s -o ControlPath=$SSH_CTL_PATH"
 ssh -O exit -o ControlPath="$SSH_CTL_PATH" -p "$SSH_PORT" "${DEST_USER}@${DEST_HOST}" 2>/dev/null || true
 
-LOG="$TMP/rsync_parallel_${RUN_TS}.log"
-ERR_LOG="$TMP/rsync_parallel_error_${RUN_TS}.log"
+LOG="$TMP/replicator_parallel_${RUN_TS}.log"
+ERR_LOG="$TMP/replicator_parallel_error_${RUN_TS}.log"
 FILES_TXT="$TMP/files_${RUN_TS}.txt"
 CHUNK_PREFIX="$TMP/chunk_${RUN_TS}_"
-SUMMARY_TXT="$TMP/rsync_summary_${RUN_TS}.tsv"
+SUMMARY_TXT="$TMP/replicator_summary_${RUN_TS}.tsv"
 FAIL_MARKERS_DIR="$TMP/failmarkers_${RUN_TS}"
 PROGRESS_FIFO="$TMP/progress_${RUN_TS}.fifo"
 SRC_LISTING="$TMP/src_listing_${RUN_TS}.txt"
@@ -125,11 +194,11 @@ mkdir -p "$FAIL_MARKERS_DIR"
 if [[ -t 1 ]]; then
   C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_DIM=$'\e[2m'
   C_RED=$'\e[31m'; C_GREEN=$'\e[32m'; C_YELLOW=$'\e[33m'
-  C_BLUE=$'\e[34m'; C_MAGENTA=$'\e[35m'; C_CYAN=$'\e[36m'
+  C_BLUE=$'\e[34m'; C_CYAN=$'\e[36m'
 else
   C_RESET=""; C_BOLD=""; C_DIM=""
   C_RED=""; C_GREEN=""; C_YELLOW=""
-  C_BLUE=""; C_MAGENTA=""; C_CYAN=""
+  C_BLUE=""; C_CYAN=""
 fi
 
 hr()     { printf '%s\n' "${C_DIM}────────────────────────────────────────────────────────────────${C_RESET}"; }
@@ -140,13 +209,15 @@ warn()   { printf '%s\n' "${C_YELLOW}⚠${C_RESET} $1" | tee -a "$LOG"; }
 fail()   { printf '%s\n' "${C_RED}✘${C_RESET} $1" | tee -a "$LOG" >&2; }
 
 # ---------------------------------------------------------------------------
-# Exclude patterns: a JSON array of strings in $EXCLUDE_FILE, e.g.
-#   ["node_modules", "*.log", "/home/steffen/Projects/foo/*"]
+# Exclude patterns: a YAML list of strings in $EXCLUDE_FILE, e.g.
+#   - node_modules
+#   - "*.log"
+#   - /home/steffen/Projects/foo/*
 # Blank/whitespace-only strings are ignored. No negation (a leading '!' is a
 # gitignore habit, not supported here — skipped with a warning rather than
 # silently mistreated as a literal filename). Absence of the file means zero
-# exclusions: no auto-create, no defaults, strictly opt-in. JSON has no
-# comment syntax, so annotate patterns externally if needed.
+# exclusions: no auto-create, no defaults, strictly opt-in. YAML supports
+# '#' comments natively, so annotate patterns right in the file if needed.
 #
 # Each raw pattern is normalized (right here at load time, ONCE) into one
 # of two internal forms, stored in EXCLUDE_PATTERNS as "kind:value":
@@ -168,8 +239,10 @@ fail()   { printf '%s\n' "${C_RED}✘${C_RESET} $1" | tee -a "$LOG" >&2; }
 EXCLUDE_PATTERNS=()
 load_exclude_patterns() {
   [[ -f "$EXCLUDE_FILE" ]] || return 0
-  command -v jq >/dev/null 2>&1 || { echo "jq is required to read $EXCLUDE_FILE but is not installed." >&2; exit 1; }
-  jq -e 'type == "array"' "$EXCLUDE_FILE" >/dev/null 2>&1 || { echo "Exclude file is not a valid JSON array of strings: $EXCLUDE_FILE" >&2; exit 1; }
+  command -v python3 >/dev/null 2>&1 || { echo "python3 (with PyYAML) is required to read $EXCLUDE_FILE but is not installed." >&2; exit 1; }
+
+  local excludes_list
+  excludes_list="$(yaml_read_list "$EXCLUDE_FILE")" || exit 1
 
   local raw trimmed src_abs rel
   src_abs="${SRC_DIR%/}"
@@ -182,10 +255,11 @@ load_exclude_patterns() {
       continue
     fi
 
-    # Patterns come from a JSON string, not parsed by the shell, so a
+    # Patterns come from a YAML string, not parsed by the shell, so a
     # leading '~' is never auto-expanded like it would be on a command
     # line — do it ourselves for the common "~" / "~/rest" forms (current
     # user's home only; "~otheruser/..." isn't supported, kept out of scope).
+    # shellcheck disable=SC2088 # intentional: matching the literal "~/" prefix, not expanding it
     if [[ "$trimmed" == "~" ]]; then
       trimmed="$HOME"
     elif [[ "$trimmed" == "~/"* ]]; then
@@ -218,7 +292,7 @@ load_exclude_patterns() {
     else
       EXCLUDE_PATTERNS+=("name:$trimmed")
     fi
-  done < <(jq -r '.[]' "$EXCLUDE_FILE")
+  done < <(printf '%s\n' "$excludes_list")
 }
 
 # ---------------------------------------------------------------------------
@@ -445,14 +519,18 @@ info "SSH:    ${DEST_USER}@${DEST_HOST} port ${SSH_PORT}"
 # Preflight: required tools
 # ---------------------------------------------------------------------------
 MISSING=()
-for bin in rsync ssh pv find split xargs awk stdbuf grep jq; do
+for bin in rsync ssh pv find split xargs awk stdbuf grep python3; do
   command -v "$bin" >/dev/null 2>&1 || MISSING+=("$bin")
 done
 if [[ ${#MISSING[@]} -gt 0 ]]; then
   fail "Missing required tools: ${MISSING[*]}"
   exit 1
 fi
-ok "All required tools present (rsync, ssh, pv, find, split, xargs, awk, stdbuf, grep, jq)"
+if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+  fail "python3's PyYAML module is required (pip install pyyaml / apt install python3-yaml) but is not available."
+  exit 1
+fi
+ok "All required tools present (rsync, ssh, pv, find, split, xargs, awk, stdbuf, grep, python3+PyYAML)"
 
 # ---------------------------------------------------------------------------
 # Preflight: SSH connectivity + remote destination directory
@@ -711,6 +789,7 @@ EXCLUDE_PATTERNS_JOINED="$(printf '%s\n' "${EXCLUDE_PATTERNS[@]-}")"
 
 export SRC_DIR DEST_USER DEST_HOST SSH_PORT TMP RUN_TS LOG ERR_LOG FAIL_MARKERS_DIR SUMMARY_TXT DEST_DIR PROGRESS_FIFO SSH_CTL_OPTS EXCLUDE_PATTERNS_JOINED
 
+# shellcheck disable=SC2016 # single-quoted on purpose: $1/$DEST_DIR must expand in the xargs-spawned subshell, not here
 if [[ "$CHUNKS" -gt 0 ]]; then
   printf "%s\0" "${CHUNK_GLOB[@]}" |
   xargs -0 -n1 -P "$JOBS" bash -c 'worker "$1" "$DEST_DIR"' _ || true
@@ -788,6 +867,7 @@ fi
 if [[ "$DEST_SCAN_OK" -eq 1 && "$EXTRANEOUS_COUNT" -gt 0 ]]; then
   set +e
   # shellcheck disable=SC2086
+  # shellcheck disable=SC2094 # false positive: EXTRANEOUS_FULL is fully written earlier and only ever read here (twice, not written)
   cut -f3 "$EXTRANEOUS_FULL" | tr '\n' '\0' |
     ssh -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=15 \
       -o StrictHostKeyChecking=accept-new $SSH_CTL_OPTS "${DEST_USER}@${DEST_HOST}" \
@@ -799,7 +879,7 @@ if [[ "$DEST_SCAN_OK" -eq 1 && "$EXTRANEOUS_COUNT" -gt 0 ]]; then
       # lockstep from fd 3) and feed it into the same shared bar as the
       # additions above, so one bar spans both kinds of change.
       while IFS= read -r _; do
-        IFS=$'\t' read -r -u 3 item_type item_size item_path || break
+        IFS=$'\t' read -r -u 3 item_type item_size _ || break
         if [[ "$item_type" == "f" && -n "${PROGRESS_FIFO:-}" && -p "$PROGRESS_FIFO" ]]; then
           head -c "$item_size" /dev/zero >> "$PROGRESS_FIFO" 2>/dev/null || true
         fi
