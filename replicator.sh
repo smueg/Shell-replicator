@@ -5,8 +5,9 @@ set -euo pipefail
 # Parallel rsync-over-SSH replication tool
 # Usage: replicator.sh SRC_DIR DEST_DIR
 #
-# Overridable via environment: TMP, RUN_TS, EXCLUDE_FILE (see below near the
-# exclude-pattern loading for its default location and file format).
+# Overridable via environment: TMP, RUN_TS, EXCLUDE_FILE, REPLICATOR_CONFIG
+# (see below near the relevant loading logic for default locations and file
+# formats).
 # ============================================================================
 
 SRC_DIR="${1:-}"
@@ -18,9 +19,46 @@ if [[ -z "${SRC_DIR}" || -z "${DEST_DIR}" ]]; then
 fi
 [[ -d "$SRC_DIR" ]] || { echo "SRC_DIR is not a directory: $SRC_DIR" >&2; exit 1; }
 
-DEST_HOST="157.245.13.145"
-DEST_USER="steffen"
-SSH_PORT=2222
+# ---------------------------------------------------------------------------
+# Destination connection settings: kept out of the script (and out of git)
+# in a JSON file in the home directory, same "opt-in dotfile" pattern as
+# EXCLUDE_FILE below. Parsed with jq. Format:
+#   {
+#     "dest_host": "157.245.13.145",
+#     "dest_user": "steffen",
+#     "ssh_port": 2222
+#   }
+# Env vars, if already set when the script is invoked, take precedence over
+# the config file (config file only fills in what isn't already set).
+# ---------------------------------------------------------------------------
+REPLICATOR_CONFIG="${REPLICATOR_CONFIG:-$HOME/.replicator.conf.json}"
+if [[ -f "$REPLICATOR_CONFIG" ]]; then
+  command -v jq >/dev/null 2>&1 || { echo "jq is required to read $REPLICATOR_CONFIG but is not installed." >&2; exit 1; }
+  jq -e . "$REPLICATOR_CONFIG" >/dev/null 2>&1 || { echo "Config file is not valid JSON: $REPLICATOR_CONFIG" >&2; exit 1; }
+
+  CONF_DEST_HOST="$(jq -r '.dest_host // empty' "$REPLICATOR_CONFIG")"
+  CONF_DEST_USER="$(jq -r '.dest_user // empty' "$REPLICATOR_CONFIG")"
+  CONF_SSH_PORT="$(jq -r '.ssh_port // empty' "$REPLICATOR_CONFIG")"
+
+  DEST_HOST="${DEST_HOST:-$CONF_DEST_HOST}"
+  DEST_USER="${DEST_USER:-$CONF_DEST_USER}"
+  SSH_PORT="${SSH_PORT:-$CONF_SSH_PORT}"
+fi
+
+DEST_HOST="${DEST_HOST:-}"
+DEST_USER="${DEST_USER:-}"
+SSH_PORT="${SSH_PORT:-}"
+
+if [[ -z "$DEST_HOST" || -z "$DEST_USER" || -z "$SSH_PORT" ]]; then
+  echo "Missing DEST_HOST, DEST_USER, and/or SSH_PORT." >&2
+  echo "Set them in $REPLICATOR_CONFIG (or export as environment variables). Example:" >&2
+  echo '  {' >&2
+  echo '    "dest_host": "157.245.13.145",' >&2
+  echo '    "dest_user": "steffen",' >&2
+  echo '    "ssh_port": 2222' >&2
+  echo '  }' >&2
+  exit 1
+fi
 
 JOBS_DEFAULT=8
 JOBS_MIN=2
@@ -32,10 +70,10 @@ JOBS_MAX=16
 TMP="${TMP:-/home/steffen/Rsync-logs}"
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
 
-# Exclude patterns: a dotfile in the home directory (not tied to wherever the
-# script itself lives), one pattern per line, opt-in — absence of this file
-# means zero exclusions. See load_exclude_patterns() below for the format.
-EXCLUDE_FILE="${EXCLUDE_FILE:-$HOME/.replicator-excludes}"
+# Exclude patterns: a JSON file in the home directory (not tied to wherever
+# the script itself lives), opt-in — absence of this file means zero
+# exclusions. See load_exclude_patterns() below for the format.
+EXCLUDE_FILE="${EXCLUDE_FILE:-$HOME/.replicator-excludes.json}"
 
 # Used both for the exclude-pattern report and the add/remove name listings
 # further down.
@@ -102,11 +140,13 @@ warn()   { printf '%s\n' "${C_YELLOW}⚠${C_RESET} $1" | tee -a "$LOG"; }
 fail()   { printf '%s\n' "${C_RED}✘${C_RESET} $1" | tee -a "$LOG" >&2; }
 
 # ---------------------------------------------------------------------------
-# Exclude patterns: one per line in $EXCLUDE_FILE, blank lines and #-comments
-# ignored. No negation (a leading '!' is a gitignore habit, not supported
-# here — skipped with a warning rather than silently mistreated as a
-# literal filename). Absence of the file means zero exclusions: no
-# auto-create, no defaults, strictly opt-in.
+# Exclude patterns: a JSON array of strings in $EXCLUDE_FILE, e.g.
+#   ["node_modules", "*.log", "/home/steffen/Projects/foo/*"]
+# Blank/whitespace-only strings are ignored. No negation (a leading '!' is a
+# gitignore habit, not supported here — skipped with a warning rather than
+# silently mistreated as a literal filename). Absence of the file means zero
+# exclusions: no auto-create, no defaults, strictly opt-in. JSON has no
+# comment syntax, so annotate patterns externally if needed.
 #
 # Each raw pattern is normalized (right here at load time, ONCE) into one
 # of two internal forms, stored in EXCLUDE_PATTERNS as "kind:value":
@@ -128,23 +168,24 @@ fail()   { printf '%s\n' "${C_RED}✘${C_RESET} $1" | tee -a "$LOG" >&2; }
 EXCLUDE_PATTERNS=()
 load_exclude_patterns() {
   [[ -f "$EXCLUDE_FILE" ]] || return 0
-  local raw line trimmed src_abs rel
+  command -v jq >/dev/null 2>&1 || { echo "jq is required to read $EXCLUDE_FILE but is not installed." >&2; exit 1; }
+  jq -e 'type == "array"' "$EXCLUDE_FILE" >/dev/null 2>&1 || { echo "Exclude file is not a valid JSON array of strings: $EXCLUDE_FILE" >&2; exit 1; }
+
+  local raw trimmed src_abs rel
   src_abs="${SRC_DIR%/}"
-  while IFS= read -r raw || [[ -n "$raw" ]]; do
-    line="${raw%$'\r'}"
-    trimmed="${line#"${line%%[![:space:]]*}"}"
+  while IFS= read -r raw; do
+    trimmed="${raw#"${raw%%[![:space:]]*}"}"
     trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
     [[ -z "$trimmed" ]] && continue
-    [[ "$trimmed" == \#* ]] && continue
     if [[ "$trimmed" == !* ]]; then
       warn "Ignoring unsupported negation pattern in $EXCLUDE_FILE: $trimmed"
       continue
     fi
 
-    # Patterns are read from a file, not parsed by the shell, so a leading
-    # '~' is never auto-expanded like it would be on a command line — do it
-    # ourselves for the common "~" / "~/rest" forms (current user's home
-    # only; "~otheruser/..." isn't supported, kept out of scope).
+    # Patterns come from a JSON string, not parsed by the shell, so a
+    # leading '~' is never auto-expanded like it would be on a command
+    # line — do it ourselves for the common "~" / "~/rest" forms (current
+    # user's home only; "~otheruser/..." isn't supported, kept out of scope).
     if [[ "$trimmed" == "~" ]]; then
       trimmed="$HOME"
     elif [[ "$trimmed" == "~/"* ]]; then
@@ -177,12 +218,20 @@ load_exclude_patterns() {
     else
       EXCLUDE_PATTERNS+=("name:$trimmed")
     fi
-  done < "$EXCLUDE_FILE"
+  done < <(jq -r '.[]' "$EXCLUDE_FILE")
 }
 
 # ---------------------------------------------------------------------------
 # Cleanup: only scrub working files when the run was fully successful.
 # Always removes pure plumbing (progress FIFO, empty fail-marker dir).
+#
+# "Successful" is decided by fail_count (worker failures, tracked via
+# FAIL_MARKERS_DIR) OR ERR_LOG actually having content — not fail_count
+# alone. Early failures (SSH connectivity down, missing tools, bad config)
+# exit before any worker ever runs, so FAIL_MARKERS_DIR stays empty even
+# though stderr was captured into ERR_LOG and the user was just told to go
+# read it; gating solely on fail_count deleted that file out from under
+# them before they could.
 # ---------------------------------------------------------------------------
 cleanup() {
   local fail_count
@@ -192,7 +241,7 @@ cleanup() {
   rm -f "$SRC_LISTING" "$DEST_LISTING" "$ADD_FULL" "$EXTRANEOUS_FULL" 2>/dev/null || true
   ssh -O exit -o ControlPath="$SSH_CTL_PATH" -p "$SSH_PORT" "${DEST_USER}@${DEST_HOST}" 2>/dev/null || true
 
-  if [[ "$fail_count" -eq 0 ]]; then
+  if [[ "$fail_count" -eq 0 && ! -s "$ERR_LOG" ]]; then
     rm -f "$ERR_LOG" 2>/dev/null || true
     rm -f "$TMP"/worker_"$RUN_TS"_W* 2>/dev/null || true
     rm -f "$FILES_TXT" "$CHUNK_PREFIX"* 2>/dev/null || true
@@ -200,7 +249,9 @@ cleanup() {
   else
     warn "Failures occurred. Keeping logs for review:"
     printf '%s\n' "  Error log:   $ERR_LOG" | tee -a "$LOG"
-    printf '%s\n' "  Worker logs: $TMP/worker_${RUN_TS}_W*" | tee -a "$LOG"
+    if [[ "$fail_count" -gt 0 ]]; then
+      printf '%s\n' "  Worker logs: $TMP/worker_${RUN_TS}_W*" | tee -a "$LOG"
+    fi
   fi
 }
 trap cleanup EXIT
@@ -394,14 +445,14 @@ info "SSH:    ${DEST_USER}@${DEST_HOST} port ${SSH_PORT}"
 # Preflight: required tools
 # ---------------------------------------------------------------------------
 MISSING=()
-for bin in rsync ssh pv find split xargs awk stdbuf grep; do
+for bin in rsync ssh pv find split xargs awk stdbuf grep jq; do
   command -v "$bin" >/dev/null 2>&1 || MISSING+=("$bin")
 done
 if [[ ${#MISSING[@]} -gt 0 ]]; then
   fail "Missing required tools: ${MISSING[*]}"
   exit 1
 fi
-ok "All required tools present (rsync, ssh, pv, find, split, xargs, awk, stdbuf, grep)"
+ok "All required tools present (rsync, ssh, pv, find, split, xargs, awk, stdbuf, grep, jq)"
 
 # ---------------------------------------------------------------------------
 # Preflight: SSH connectivity + remote destination directory
