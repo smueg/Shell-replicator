@@ -6,9 +6,9 @@
 
 Usage: replicator.sh SRC_DIR DEST_DIR
 
-Overridable via environment: TMP, RUN_TS, EXCLUDE_FILE, REPLICATOR_CONFIG,
+Overridable via environment: TMP, RUN*TS, EXCLUDE_FILE, REPLICATOR_CONFIG,
 REPLICATOR_SETTINGS_DIR
-_(see below for default locations and file formats)_.
+*(see below for default locations and file formats)\_.
 
 ---
 
@@ -50,14 +50,14 @@ Any of these can also be set as environment variables (`DEST_HOST`,
 A YAML list of strings, opt-in — if the file doesn't exist, nothing is
 excluded. Each entry is normalized into one of three matching behaviors:
 
-1. **Bare name** (no `/`) — matches that name at *any depth* in the tree,
+1. **Bare name** (no `/`) — matches that name at _any depth_ in the tree,
    file or directory alike (same as `find -name`).
    ```yaml
    - node_modules
    - .DS_Store
    ```
 2. **A path** (contains `/`, no trailing `/*`) — anchored to `SRC_DIR`,
-   excludes that exact file/directory *and*, for a directory, everything
+   excludes that exact file/directory _and_, for a directory, everything
    beneath it. Can be relative to `SRC_DIR`, or absolute as long as it
    falls under `SRC_DIR` (the prefix is stripped automatically; an
    absolute path outside `SRC_DIR` can never match and is rejected with
@@ -66,7 +66,7 @@ excluded. Each entry is normalized into one of three matching behaviors:
    - build/cache
    - /home/steffen/Projects/foo/logs
    ```
-3. **A path ending in `/*`** — excludes only the *contents* of that
+3. **A path ending in `/*`** — excludes only the _contents_ of that
    directory; the directory itself is still created/replicated (empty)
    on the destination.
    ```yaml
@@ -81,6 +81,14 @@ entry is skipped with a warning rather than silently mistreated.
 
 Both files require `python3` with PyYAML installed — YAML is parsed
 natively, with no JSON conversion or `jq`/`yq` dependency involved.
+
+---
+
+### Build file list:
+
+1. Regular files, directories (incl. empty), and symlinks, so new files AND new/empty directories are always replicated.
+
+2. Captures mtime too, so the destination comparison below can tell which files are actually new/changed versus already in sync.
 
 ---
 
@@ -137,9 +145,3 @@ One real TCP+auth handshake, reused by the preflight check, every worker's rsync
 2. Always removes pure plumbing (progress FIFO, empty fail-marker dir).
 
 ---
-
-### Build file list:
-
-1. Regular files, directories (incl. empty), and symlinks, so new files AND new/empty directories are always replicated.
-
-2. Captures mtime too, so the destination comparison below can tell which files are actually new/changed versus already in sync.
