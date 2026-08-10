@@ -89,10 +89,10 @@ PYEOF
 # All external settings (this file, EXCLUDE_FILE below) live together in
 # $HOME/Replicator-Settings/ for easy maintenance — kept out of the script
 # (and out of git), same "opt-in" pattern as before. Format:
-#   dest_host: 157.245.13.145
-#   dest_user: steffen
-#   ssh_port: 2222
-#   log_dir: /home/steffen/Rsync-logs   # optional; see TMP below (defaults to /tmp if unset)
+#   dest_host: 203.0.113.1
+#   dest_user: user
+#   ssh_port: 22
+#   log_dir: /home/user/Rsync-logs   # optional; see TMP below (defaults to /tmp if unset)
 # Env vars, if already set when the script is invoked, take precedence over
 # the config file (config file only fills in what isn't already set).
 # ---------------------------------------------------------------------------
@@ -121,9 +121,9 @@ SSH_PORT="${SSH_PORT:-}"
 if [[ -z "$DEST_HOST" || -z "$DEST_USER" || -z "$SSH_PORT" ]]; then
   echo "Missing DEST_HOST, DEST_USER, and/or SSH_PORT." >&2
   echo "Set them in $REPLICATOR_CONFIG (or export as environment variables). Example:" >&2
-  echo '  dest_host: 157.245.13.145' >&2
-  echo '  dest_user: steffen' >&2
-  echo '  ssh_port: 2222' >&2
+  echo '  dest_host: 203.0.113.1' >&2
+  echo '  dest_user: user' >&2
+  echo '  ssh_port: 22' >&2
   exit 1
 fi
 
@@ -225,7 +225,7 @@ fail()   { printf '%s\n' "${C_RED}✘${C_RESET} $1" | tee -a "$LOG" >&2; }
 # Exclude patterns: a YAML list of strings in $EXCLUDE_FILE, e.g.
 #   - node_modules
 #   - "*.log"
-#   - /home/steffen/Projects/foo/*
+#   - /home/user/Projects/foo/*
 # Blank/whitespace-only strings are ignored. No negation (a leading '!' is a
 # gitignore habit, not supported here — skipped with a warning rather than
 # silently mistreated as a literal filename). Absence of the file means zero
@@ -241,7 +241,7 @@ fail()   { printf '%s\n' "${C_RED}✘${C_RESET} $1" | tee -a "$LOG" >&2; }
 #                  SRC_DIR (or DEST_DIR on the remote side) / rsync's
 #                  --exclude=/VALUE.
 # Users naturally write exclude patterns as absolute filesystem paths
-# (e.g. "/home/steffen/Projects/foo/*") rather than paths relative to
+# (e.g. "/home/user/Projects/foo/*") rather than paths relative to
 # SRC_DIR — an absolute pattern is accepted as long as it falls under
 # SRC_DIR, with the SRC_DIR prefix stripped to produce the relative form;
 # an absolute pattern that does NOT fall under SRC_DIR can never match
