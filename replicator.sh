@@ -129,7 +129,7 @@ fi
 
 JOBS_DEFAULT=8
 JOBS_MIN=2
-JOBS_MAX=16
+JOBS_MAX=32
 # CHUNK_LINES itself is computed dynamically once the source tree is
 # scanned (see below) — sized relative to JOBS_MAX so chunk count never
 # becomes the bottleneck on concurrency.
