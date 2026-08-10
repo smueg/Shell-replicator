@@ -92,7 +92,7 @@ PYEOF
 #   dest_host: 157.245.13.145
 #   dest_user: steffen
 #   ssh_port: 2222
-#   log_dir: /home/steffen/Rsync-logs   # optional; see TMP below
+#   log_dir: /home/steffen/Rsync-logs   # optional; see TMP below (defaults to /tmp if unset)
 # Env vars, if already set when the script is invoked, take precedence over
 # the config file (config file only fills in what isn't already set).
 # ---------------------------------------------------------------------------
@@ -135,8 +135,10 @@ JOBS_MAX=16
 # becomes the bottleneck on concurrency.
 
 # Log/working-file directory: env TMP wins if already set, else log_dir
-# from REPLICATOR_CONFIG (loaded above), else this hardcoded fallback.
-TMP="${TMP:-/home/steffen/Rsync-logs}"
+# from REPLICATOR_CONFIG (loaded above), else the system temp directory —
+# no log_dir configured means logs land in /tmp rather than silently
+# picking a path specific to whoever first wrote this script.
+TMP="${TMP:-/tmp}"
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
 
 # Exclude patterns: a YAML file in REPLICATOR_SETTINGS_DIR (not tied to
@@ -200,6 +202,17 @@ else
   C_RED=""; C_GREEN=""; C_YELLOW=""
   C_BLUE=""; C_CYAN=""
 fi
+
+human_size() {
+  awk -v bytes="${1:-0}" 'BEGIN {
+    units[0]="B"; units[1]="KB"; units[2]="MB"; units[3]="GB"; units[4]="TB"; units[5]="PB"
+    size = bytes + 0
+    i = 0
+    while (size >= 1024 && i < 5) { size /= 1024; i++ }
+    if (i == 0) printf "%d %s", size, units[i]
+    else printf "%.1f %s", size, units[i]
+  }'
+}
 
 hr()     { printf '%s\n' "${C_DIM}────────────────────────────────────────────────────────────────${C_RESET}"; }
 banner() { hr; printf '%s\n' "${C_BOLD}${C_CYAN}  $1${C_RESET}"; hr; }
@@ -480,7 +493,7 @@ worker() {
     echo "FAIL: worker=$wtag chunk=$(basename "$chunk_file") exit=$rsync_exit transferred_bytes=$transferred_bytes files_transferred=$transferred_files" >> "$LOG"
 
     printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
-      "$(basename "$chunk_file")" "$rsync_exit" "$transferred_bytes" "$transferred_files" "NA" "NA" >> "$SUMMARY_TXT"
+      "$(basename "$chunk_file")" "$rsync_exit" "$(human_size "$transferred_bytes")" "$transferred_files" "NA" "NA" >> "$SUMMARY_TXT"
 
     return 1
   fi
@@ -495,11 +508,11 @@ worker() {
   echo "OK:   worker=$wtag chunk=$(basename "$chunk_file") exit=$rsync_exit changed=$changed already=$already transferred_bytes=$transferred_bytes files_transferred=$transferred_files" >> "$LOG"
 
   printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
-    "$(basename "$chunk_file")" "$rsync_exit" "$transferred_bytes" "$transferred_files" "$changed" "$already" >> "$SUMMARY_TXT"
+    "$(basename "$chunk_file")" "$rsync_exit" "$(human_size "$transferred_bytes")" "$transferred_files" "$changed" "$already" >> "$SUMMARY_TXT"
 
   return 0
 }
-export -f worker
+export -f worker human_size
 
 rm -f "$FILES_TXT" "$CHUNK_PREFIX"* "$LOG" "$ERR_LOG" "$SUMMARY_TXT" 2>/dev/null || true
 rm -f "$TMP"/worker_"$RUN_TS"_W* 2>/dev/null || true
@@ -507,7 +520,7 @@ rm -f "$TMP"/worker_"$RUN_TS"_W* 2>/dev/null || true
 : > "$LOG"
 : > "$ERR_LOG"
 : > "$SUMMARY_TXT"
-printf "chunk\texit\tbytes\tfiles\tchanged\talready\n" > "$SUMMARY_TXT"
+printf "chunk\texit\tsize\tfiles\tchanged\talready\n" > "$SUMMARY_TXT"
 
 banner "Parallel Rsync Replication"
 info "Start:  $(date)"
@@ -604,7 +617,7 @@ read -r TOTAL_FILES TOTAL_DIRS TOTAL_LINKS TOTAL_BYTES < <(
 TOTAL_ENTRIES="$(wc -l < "$FILES_TXT")"
 
 info "Entries to sync: $TOTAL_ENTRIES  (files: $TOTAL_FILES, dirs: $TOTAL_DIRS, symlinks: $TOTAL_LINKS)"
-info "Total data size: $TOTAL_BYTES bytes"
+info "Total data size: $(human_size "$TOTAL_BYTES")"
 
 # ---------------------------------------------------------------------------
 # Scan the destination too, up front — so we know everything that needs to
@@ -911,8 +924,8 @@ if [[ "$TOTAL_CHANGED_FILES" -gt 0 || "$EXTRANEOUS_COUNT" -gt 0 ]]; then
 else
   ok "Replication propagation completed successfully — destination already up to date."
 fi
-info "Files added/updated: $TOTAL_CHANGED_FILES  ($TOTAL_CHANGED_BYTES bytes)"
-info "Items removed:       $EXTRANEOUS_COUNT  ($REMOVE_BYTES bytes)"
+info "Files added/updated: $TOTAL_CHANGED_FILES  ($(human_size "$TOTAL_CHANGED_BYTES"))"
+info "Items removed:       $EXTRANEOUS_COUNT  ($(human_size "$REMOVE_BYTES"))"
 
 echo
 info "Main log: $LOG"
