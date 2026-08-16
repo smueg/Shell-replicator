@@ -97,7 +97,7 @@ PYEOF
 # the config file (config file only fills in what isn't already set).
 # ---------------------------------------------------------------------------
 REPLICATOR_SETTINGS_DIR="${REPLICATOR_SETTINGS_DIR:-$HOME/Replicator-Settings}"
-REPLICATOR_CONFIG="${REPLICATOR_CONFIG:-$REPLICATOR_SETTINGS_DIR/replicator-config.yaml}"
+REPLICATOR_CONFIG="${REPLICATOR_CONFIG:-$REPLICATOR_SETTINGS_DIR/replicator-config.yml}"
 if [[ -f "$REPLICATOR_CONFIG" ]]; then
   command -v python3 >/dev/null 2>&1 || { echo "python3 (with PyYAML) is required to read $REPLICATOR_CONFIG but is not installed." >&2; exit 1; }
 
@@ -144,7 +144,7 @@ RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
 # Exclude patterns: a YAML file in REPLICATOR_SETTINGS_DIR (not tied to
 # wherever the script itself lives), opt-in — absence of this file means
 # zero exclusions. See load_exclude_patterns() below for the format.
-EXCLUDE_FILE="${EXCLUDE_FILE:-$REPLICATOR_SETTINGS_DIR/replicator-excludes.yaml}"
+EXCLUDE_FILE="${EXCLUDE_FILE:-$REPLICATOR_SETTINGS_DIR/replicator-excludes.yml}"
 
 # Used both for the exclude-pattern report and the add/remove name listings
 # further down.
