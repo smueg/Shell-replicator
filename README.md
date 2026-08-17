@@ -15,7 +15,9 @@ human-readable (`B`/`KB`/`MB`/`GB`/`TB`/`PB`), not raw byte counts.
 
 Exit codes: `0` success, `1` bad usage / missing tools / SSH or config
 failure (nothing was transferred), `2` one or more chunks failed to
-replicate (see the error log).
+replicate (see the error log), `3` transfer succeeded but deletion
+propagation (removing extraneous destination items) failed (see the error
+log).
 
 ---
 
@@ -32,20 +34,23 @@ The script runs these steps in order:
 3. **Establish SSH connection multiplexing** — one control connection is
    opened and reused for every later SSH call this run. See
    [SSH connection multiplexing](#ssh-connection-multiplexing).
-4. **Preflight: required tools** — checks for `rsync`, `ssh`, `pv`, `find`,
-   `split`, `xargs`, `awk`, `stdbuf`, `grep`, `python3` (+ PyYAML); exits if
-   anything is missing.
+4. **Preflight: required tools** — checks for `rsync`, `ssh`, `find`,
+   `split`, `xargs`, `awk`, `stdbuf`, `grep`, `python3` (+ PyYAML and
+   `tqdm`, the latter used to render the progress bars — see
+   [Progress bar](#progress-bar)); exits if anything is missing.
 5. **Preflight: SSH connectivity** — connects to the destination and runs
    `mkdir -p` on `DEST_DIR` remotely; exits if the connection or directory
    creation fails.
 6. **Load exclude patterns** — reads `EXCLUDE_FILE` (if present) and
    reports how many patterns are active. See
    [`replicator-excludes.yaml`](#replicator-excludesyaml--exclude-patterns).
-7. **Scan the source tree** — walks `SRC_DIR` (honoring excludes) and
-   records every file, directory, and symlink, plus size and mtime for
-   each. See [Build file list](#build-file-list).
-8. **Scan the destination tree and diff** — walks `DEST_DIR` over the same
-   SSH connection and compares it against the source scan to determine
+7. **Scan the source and destination trees concurrently** — `SRC_DIR` is
+   walked locally while `DEST_DIR` is walked over the same SSH connection
+   at the same time (two background jobs, joined before the diff), since
+   the two scans are otherwise independent and the remote one is a full
+   SSH round-trip. See [Build file list](#build-file-list) and
+   [Destination scan and diff](#destination-scan-and-diff).
+8. **Diff source vs. destination** — once both scans are in, determines
    exactly what needs adding/updating and what's extraneous (present on
    the destination but no longer in the source). See
    [Destination scan and diff](#destination-scan-and-diff).
@@ -53,25 +58,31 @@ The script runs these steps in order:
    there are always comfortably more chunks than the maximum job count,
    so concurrency isn't capped by chunk count. See
    [Parallel transfer workers](#parallel-transfer-workers).
-10. **Start the progress bar** — only if step 8 found real work to do; one
-    combined `pv` bar covers both additions and removals. See
-    [Progress bar](#progress-bar).
-11. **Run parallel rsync workers** — up to `JOBS` chunks transfer at once,
-    each with its own retry/backoff on failure. See
+10. **Run parallel rsync workers, with a live "Uploading" progress bar** —
+    up to `JOBS` chunks transfer at once, each with its own retry/backoff
+    on failure; a live aggregate header line plus one row per concurrently
+    active worker (only if step 8 found additions/updates) tracks the
+    transfer as it actually happens — several files in flight at once show
+    as several rows, each with its own real 0–100% bar for that specific
+    file — and is fully closed before anything below prints.
+    See [Progress bar](#progress-bar) and
     [Parallel transfer workers](#parallel-transfer-workers).
-12. **Adapt `JOBS` for next run** — based on how this run went (failures,
+11. **Adapt `JOBS` for next run** — based on how this run went (failures,
     retries, or a clean run). See [Adaptive JOBS](#adaptive-jobs).
-13. **Print the run summary** — chunk counts, failures, successes, retries,
-    and the JOBS adjustment. If any chunk failed, the script stops here
-    and exits `2` — deletions (next step) never run on a partial/failed
-    transfer.
-14. **Propagate deletions** — removes from `DEST_DIR` everything the
-    diff in step 8 flagged as extraneous, feeding the same progress bar.
-    Only runs after a fully successful transfer.
-15. **Print the final summary** — files added/updated and items removed
-    (human-readable sizes), plus the paths to the main log and the
-    per-chunk summary file. See [Log files](#log-files-written-under-tmp-override-path-to-foo).
-16. **Clean up** — always runs (via an exit trap), regardless of how the
+12. **Propagate deletions, with a live "Removing" progress bar** — removes
+    from `DEST_DIR` everything the diff in step 8 flagged as extraneous,
+    with its own header + row (separate from the Uploading block above),
+    fully closed before the summary prints. Only runs after a fully
+    successful transfer — skipped entirely if any chunk failed.
+13. **Print the summary** — chunk counts, failures, successes, retries, the
+    JOBS adjustment, deletion outcome, and files added/updated + items
+    removed (human-readable sizes), plus the paths to the main log and the
+    per-chunk summary file. Printed only after both progress phases above
+    are fully closed, so it never interleaves with a still-live progress
+    line. If any chunk failed, exits `2` here (deletions never ran). If
+    deletion propagation itself failed, exits `3` here. See
+    [Log files](#log-files-written-under-tmp-override-path-to-foo).
+14. **Clean up** — always runs (via an exit trap), regardless of how the
     script exits. See [Cleanup](#cleanup).
 
 ---
@@ -164,16 +175,20 @@ natively, with no JSON conversion or `jq`/`yq` dependency involved.
 
 Before any transfer starts, the destination tree is scanned the same way
 the source was (same `find`-based walk, run remotely over the multiplexed
-SSH connection), so the script knows the complete picture up front:
+SSH connection) — and, since the two scans don't depend on each other, they
+run concurrently as two background jobs (local `find` for the source,
+remote `ssh find` for the destination) rather than one after the other, so
+the script isn't paying the destination's SSH round-trip on top of the
+source scan's time. Both are joined before the diff, which then works out:
 
 1. **Additions/updates** — anything in the source that's missing from the
    destination, or a file whose size or mtime differs (the same
    comparison rsync's own default quick-check uses).
 2. **Extraneous items** — anything present on the destination but no
    longer in the source; these are only ever removed after a fully
-   successful transfer (see step 14 in [How it works](#how-it-works)).
+   successful transfer (see step 12 in [How it works](#how-it-works)).
 
-Both lists are used to size the progress bar accurately and to print the
+Both lists are used to size the progress bars accurately and to print the
 names of what's changing (capped at `NAME_LIST_CAP`, currently 50, so a
 huge change set doesn't flood the terminal — still reported as a real
 count, never silently truncated).
@@ -199,7 +214,8 @@ Up to `JOBS` chunks run concurrently via `xargs -P`. Each worker:
   multiplexed SSH connection.
 - Retries up to 4 attempts total on failure, backing off 10s, 30s, then
   60s between attempts.
-- Streams per-file transfer progress into the shared progress bar.
+- Streams per-file transfer progress (bytes and item name) into the
+  "Uploading" progress phase.
 - Writes its own log (kept only if the run fails) and appends a row to
   the per-chunk summary file.
 
@@ -207,7 +223,7 @@ Deletion of files removed from the source is **not** handled by rsync's
 own `--delete` inside each worker (a worker only ever sees its own
 chunk's fragment of any given directory, so `--delete` would have no
 complete view). It's handled separately, after all chunks succeed — see
-step 14 in [How it works](#how-it-works).
+step 12 in [How it works](#how-it-works).
 
 ---
 
@@ -219,13 +235,179 @@ One real TCP+auth handshake, reused by the preflight check, every worker's rsync
 
 ### Progress bar
 
-A single `pv` bar, sized to the combined bytes of everything that will
-actually change this run (additions + removals from the destination
-diff), is shown only when there's real work to do. It's fed twice: once
-per completed file during the parallel transfer (step 11), and again
-during deletion propagation (step 14) — so one bar spans the whole run.
-When nothing needs to change, the script says so and skips the bar
-entirely.
+Two sequential phases — one for the upload/update transfer, one for
+deletion propagation — both labeled simply **"Syncing"** (the wording is
+the same regardless of whether the objects underneath are being
+added, updated, or removed; the per-object action tag, and its color,
+already carries that distinction). Each phase is rendered with Python's
+[`tqdm`](https://github.com/tqdm/tqdm) as a **manifest**: every object
+rsync actually itemizes — regular file, directory, symlink, device, or
+anything else — gets its own entry, not just regular files. Each entry
+gets a real, independently-updating 0–100% bar while it's actually being
+synced, with its fill color **progressing red → amber → green as it nears
+completion** rather than sitting at one static color. The instant it
+finishes, that bar is replaced by a **permanent, colored, one-line
+completion record**, tagged with what it was and what kind of object it
+is — so the display becomes a line-by-line log of the whole manifest, not
+just a snapshot of whatever happened to still be moving when you looked.
+A single aggregate bar for the phase as a whole sits **last, below the
+entire manifest**, for the whole duration of the phase — not just once
+everything above it has finished:
+
+```
+✓ UPD FILE file_updated.txt  100%  14.0B  in 00:00  avg 39.9B/s
+✓ UPD LNK  link_new  100%  16.0B  in 00:00  avg 45.6B/s
+  NEW FILE other_target.txt   62%|███████████        | 8.00/13.0  37.1B/s  elapsed 00:00 ETA 00:00
+Syncing TOTAL:  77%|███████████████             | 30.0/39.0B  58.0B/s  elapsed 00:01
+```
+
+The top two lines are permanent completion records (bold, green ✓ for
+`NEW`, cyan for `UPD`, red for `DEL`, followed by a type tag — `FILE`,
+`DIR`, `LNK`, `DEV`, `SPEC`, or `OBJ` for anything else — the object's
+name, final size, how long it took, and its average transfer rate) — these
+stay on screen for the rest of the run and are still there in a screenshot
+or terminal copy/paste taken any time afterward. The third line is a live
+bar for whatever's still actually being synced — its own percent, bytes
+done/total, rate, elapsed time, and ETA, with a bold action+type tag and a
+fill color that shifts from red toward green as it approaches 100%. The
+last line is the bold `TOTAL` aggregate for the whole phase, whose own
+fill color progresses the same way; it's always the bottom-most line of
+the block, so it reads as the running total *underneath* the manifest
+rather than something separate from it.
+
+Only regular-file bytes count toward the aggregate's own percentage —
+directories, symlinks, and other non-file objects still get their own live
+bar and permanent completion line, but contribute nothing to the
+byte-total math, matching how the "Total data size" reported at the start
+of the run is computed (file bytes only). Folding a directory's own
+(usually 4KB-inode) size into that total would let the aggregate reach
+100% before every object in the manifest was actually finished.
+
+- **Uploading** phase (labeled "Syncing" on screen, during step 10). Sized
+  to the bytes the destination diff found needs adding/updating. Live bars
+  use up to `min(JOBS, chunk count, items actually needing upload,
+  PROGRESS_MAX_SLOTS)` screen rows, reused across the run as objects finish
+  and new ones start — but that cap only limits how many can be
+  concurrently *in flight* on screen at once, not how many completion
+  records accumulate: every object that's added or updated gets its own
+  permanent line regardless of `PROGRESS_MAX_SLOTS`. Each worker's rsync
+  runs with `--progress`, which reports real incremental byte/percent
+  updates *for whichever file that worker is currently sending* — that's
+  what drives each file's live bar (directories/symlinks/etc. have no
+  incremental progress of their own — rsync itemizes them and moves on —
+  so their bar jumps straight to 100%, held visible the same guaranteed
+  minimum duration as everything else; see below). Capping by chunk count
+  and by how many items actually need uploading matters on an incremental
+  run: chunking is sized off the whole tree (so every chunk's rsync
+  quick-check runs), not off how few items the diff found changed, so most
+  chunks on a small incremental sync transfer nothing at all — without
+  this cap the live-bar pool would reserve rows for workers that were
+  never going to have anything to show.
+- **Removing** phase (also labeled "Syncing" on screen, during step 12),
+  sized to the bytes the diff found extraneous on the destination.
+  Deletion isn't parallelized (one sequential SSH call walks the
+  extraneous list) and `rm` has no partial-progress concept of its own, so
+  each removed object's live bar jumps straight to 100% and becomes a
+  permanent completion line tagged `DEL`.
+
+A file small or fast enough to finish within a single redraw tick would
+otherwise skip the live bar entirely — created and immediately replaced by
+its completion line before a human eye could ever register it, especially
+over a fast connection. Two things prevent that: every bar gets one
+unthrottled `refresh()` the instant it's created (so its first, red frame
+is always actually written to the terminal, not just internally tracked
+and then silently redrawn-over), and a slot is held open for at least 0.35
+seconds before being closed/reused, even if the underlying transfer already
+finished faster than that. That hold only delays the *display*, not the
+real rsync work behind it, which has already completed — but it does sit
+in the same single-threaded reader that drains `PROGRESS_EVENTS_FIFO`, so
+an unbounded version of it could, on a run with hundreds of tiny files,
+fall behind far enough to back up the FIFO's kernel buffer and start
+blocking worker writes — turning a cosmetic nicety into a real slowdown.
+A 3-second total budget for this hold, shared across the whole phase,
+keeps that worst case bounded: once spent, files still get their
+guaranteed first frame, just not the extra hold time.
+
+Getting real sub-file progress out of `rsync --progress` requires reading
+its output character-by-character rather than line-by-line: rsync
+`\r`-separates the incremental updates for one file (so a real terminal
+overwrites them in place) and only emits a true `\n` once that file is
+done — a plain `read` loop would block until then and only ever see the
+fully-transferred state. Each worker instead pipes rsync's output through
+`tr '\r' '\n'` first, turning every incremental update into its own line
+the instant it's flushed, then classifies each resulting line as either a
+"started file X (size N)" or "progress: N bytes so far" event and pushes
+it to the shared events stream tagged with that worker's id.
+
+Each phase is driven by a single Python reader process (embedded in
+`replicator.sh` the same way the YAML config/exclude-file parsers are, via
+`python3 - <<'PYEOF' ... PYEOF`) — not one process per worker — that reads
+those tagged events and attributes each to the live bar its worker owns:
+reusing the row already assigned to that worker, claiming a free row, or
+reclaiming the least-recently-updated row once all of them are in use (its
+occupant is finished, so it's turned into a completion line first). A
+finished live bar is closed with `leave=False` (clears its row) and
+immediately followed by a `tqdm.write()` call, which is `tqdm`'s
+purpose-built way to interleave a permanent scrolled line with still-active
+bars — it temporarily clears them, writes the line above, and redraws them.
+Earlier attempts at "leave the bar itself behind, frozen" by opening every
+file's bar at its own never-reused `position=` and closing it with
+`leave=True` looked reasonable but turned out to corrupt `tqdm`'s own
+cursor bookkeeping once more than one such bar was ever open at a time —
+verified with a raw pty capture replayed through a real terminal emulator
+([`pyte`](https://github.com/selectel/pyte)), which showed leftover
+trailing characters and, in one case, a line rendered in the wrong screen
+position entirely; `position=`+`leave=True` closes are only safe one at a
+time, which a genuinely concurrent multi-file transfer can't guarantee.
+`tqdm.write()` doesn't have that restriction, which is why the permanent
+record goes through it instead.
+
+The aggregate bar itself hits a related but distinct `tqdm` quirk: its
+`close()` method hardcodes `self.display(pos=0)` for a `leave=True` bar,
+regardless of that bar's actual `position=` — verified by reading `tqdm`'s
+own source. That's a reasonable assumption for the conventional case (a
+`leave=True` bar is normally the outer/root bar, already at position 0),
+but the aggregate here is deliberately positioned *last* (`position=n`, the
+bottom row, so it renders under the manifest rather than above it) — so
+that hardcoded call wrote its final frame at the wrong row, corrupting the
+block (a duplicated frame, and a banner line getting overwritten,
+reproduced and confirmed via the same `pyte`-replayed pty capture
+mentioned above). Sidestepped the same way per-object completions already
+are: the aggregate closes `leave=False` (the codepath that *does* use its
+real position) once every other bar in the phase has already closed, and
+its own final line is hand-written via `tqdm.write()` immediately after —
+prefixed with an explicit `\r`, since (also verified from source) the
+`leave=False` close path clears via `display(msg='', pos=pos)` directly
+rather than `tqdm`'s own `clear()`, and only `clear()` resets the cursor's
+column back to the start of the line afterward.
+
+Every `tqdm` instance is created with an explicit `ncols=` (from
+`shutil.get_terminal_size()`, with a `120`-column fallback) rather than
+left to auto-detect. `tqdm`'s own renderer silently discards the entire
+custom `bar_format` above — falling back to its plain built-in layout, no
+colors, no `TOTAL`/elapsed detail — whenever it resolves the terminal width
+to exactly `0` columns, which some environments report (certain
+multiplexers, log-capture wrappers, or a pty whose window size hasn't
+propagated yet). Passing an explicit width sidesteps that codepath so the
+richer formatting can't silently vanish.
+
+This also deliberately does *not* run `pv` as a second, independent
+live-updating process: two uncoordinated processes both writing
+cursor-control sequences to the same terminal can't be made reliably
+race-free in a shell script, and an earlier version of this that tried
+(`pv` for the bar, a second process for a "current item" line) would
+occasionally lose sync and print duplicate/stacked bars instead of
+overwriting in place. A single writer has nothing to race with.
+
+A phase is skipped entirely if it has nothing to do (e.g. an update-only
+run skips "Removing"). Both phases are always fully finished and closed
+before the summary section prints, so the live output never interleaves
+with the summary text. Redraws are throttled to at most 4/sec so a tree
+with many small files doesn't flood the terminal, and the whole live
+display is skipped when stderr isn't a terminal (e.g. output redirected to
+a file) — nothing here is written in that case. When there's nothing to
+add or remove at all, the script says so and skips both phases. Requires
+the `tqdm` Python module (see [step 4](#how-it-works) above).
 
 ---
 
@@ -271,7 +453,8 @@ deleted automatically on a fully successful run:
 **Always deleted at the end of the run** (transient working files, not
 logs — never worth keeping): `src_listing_<RUN_TS>.txt`,
 `dest_listing_<RUN_TS>.txt`, `toadd_<RUN_TS>.txt`,
-`extraneous_<RUN_TS>.txt`, `progress_<RUN_TS>.fifo`.
+`extraneous_<RUN_TS>.txt`, `progress_events_<RUN_TS>.fifo`,
+`local_scan_<RUN_TS>.txt`, `dest_scan_exit_<RUN_TS>.txt`.
 
 **Persists across runs, never cleaned up:** `.jobs_state` — the adaptive
 JOBS history (see above), not scoped to a single `RUN_TS`.

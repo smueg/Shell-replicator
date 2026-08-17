@@ -130,6 +130,13 @@ fi
 JOBS_DEFAULT=8
 JOBS_MIN=2
 JOBS_MAX=32
+# Cap on how many simultaneous live per-file bar positions the progress
+# display (see start_progress_phase below) reuses at once, regardless of how
+# high JOBS is — past this, more rows costs terminal real estate without
+# adding much readability. Every file still gets a permanent completion line
+# once it finishes, regardless of this cap — it only bounds how many can be
+# concurrently *in flight* on screen at once.
+PROGRESS_MAX_SLOTS=10
 # CHUNK_LINES itself is computed dynamically once the source tree is
 # scanned (see below) — sized relative to JOBS_MAX so chunk count never
 # becomes the bottleneck on concurrency.
@@ -159,7 +166,10 @@ mkdir -p "$TMP"
 # ---------------------------------------------------------------------------
 JOBS_STATE_FILE="$TMP/.jobs_state"
 if [[ -f "$JOBS_STATE_FILE" ]] && JOBS="$(cat "$JOBS_STATE_FILE" 2>/dev/null)" && [[ "$JOBS" =~ ^[0-9]+$ ]]; then
-  :
+  # Defense-in-depth: clamp even on read, in case the state file was
+  # hand-edited or written by a future code path that forgets to clamp.
+  [[ "$JOBS" -lt "$JOBS_MIN" ]] && JOBS="$JOBS_MIN"
+  [[ "$JOBS" -gt "$JOBS_MAX" ]] && JOBS="$JOBS_MAX"
 else
   JOBS="$JOBS_DEFAULT"
 fi
@@ -182,11 +192,13 @@ FILES_TXT="$TMP/files_${RUN_TS}.txt"
 CHUNK_PREFIX="$TMP/chunk_${RUN_TS}_"
 SUMMARY_TXT="$TMP/replicator_summary_${RUN_TS}.tsv"
 FAIL_MARKERS_DIR="$TMP/failmarkers_${RUN_TS}"
-PROGRESS_FIFO="$TMP/progress_${RUN_TS}.fifo"
+PROGRESS_EVENTS_FIFO="$TMP/progress_events_${RUN_TS}.fifo"
 SRC_LISTING="$TMP/src_listing_${RUN_TS}.txt"
 DEST_LISTING="$TMP/dest_listing_${RUN_TS}.txt"
 ADD_FULL="$TMP/toadd_${RUN_TS}.txt"
 EXTRANEOUS_FULL="$TMP/extraneous_${RUN_TS}.txt"
+LOCAL_SCAN_RESULT="$TMP/local_scan_${RUN_TS}.txt"
+DEST_SCAN_EXIT_FILE="$TMP/dest_scan_exit_${RUN_TS}.txt"
 
 mkdir -p "$FAIL_MARKERS_DIR"
 
@@ -324,8 +336,9 @@ cleanup() {
   local fail_count
   fail_count="$(find "$FAIL_MARKERS_DIR" -type f 2>/dev/null | wc -l)"
 
-  rm -f "$PROGRESS_FIFO" 2>/dev/null || true
+  rm -f "$PROGRESS_EVENTS_FIFO" 2>/dev/null || true
   rm -f "$SRC_LISTING" "$DEST_LISTING" "$ADD_FULL" "$EXTRANEOUS_FULL" 2>/dev/null || true
+  rm -f "$LOCAL_SCAN_RESULT" "$DEST_SCAN_EXIT_FILE" 2>/dev/null || true
   ssh -O exit -o ControlPath="$SSH_CTL_PATH" -p "$SSH_PORT" "${DEST_USER}@${DEST_HOST}" 2>/dev/null || true
 
   if [[ "$fail_count" -eq 0 && ! -s "$ERR_LOG" ]]; then
@@ -376,6 +389,7 @@ worker() {
     --partial-dir=.rsync-partial
     "--out-format=%i|%l|%n"
     --info=stats2
+    --progress
   )
 
   # Exclude patterns as defense-in-depth alongside the find-level pruning
@@ -433,27 +447,71 @@ worker() {
     stdbuf -oL rsync "${rsync_opts[@]}" \
         --files-from="$chunk_file" \
         -e "$ssh_cmd" \
-        "${SRC_DIR}/" "$dest_spec" 2>&1 |
+        "${SRC_DIR}/" "$dest_spec" 2>&1 | tr '\r' '\n' |
     {
-      # Batch bytes into the FIFO instead of spawning `head` per file —
-      # flushing every ~4MB instead of every single completed file keeps
-      # subprocess spawns low on chunks with many files while still
-      # updating the bar in a visually live way.
-      pending_bytes=0
-      flush_threshold=$((4 * 1024 * 1024))
-      while IFS='|' read -r itemized bytes name; do
-        printf '%s|%s|%s\n' "$itemized" "$bytes" "$name" >> "$worker_log"
-        if [[ -n "${bytes:-}" && "${itemized:1:1}" == "f" ]]; then
-          pending_bytes=$(( pending_bytes + bytes ))
-          if [[ "$pending_bytes" -ge "$flush_threshold" && -n "${PROGRESS_FIFO:-}" && -p "$PROGRESS_FIFO" ]]; then
-            head -c "$pending_bytes" /dev/zero >> "$PROGRESS_FIFO" 2>/dev/null || true
-            pending_bytes=0
+      # `--progress` makes rsync print, per file: the itemize/name line
+      # first (our own "%i|%l|%n" format, which also carries that file's
+      # total size up front), then a run of incremental byte/percent
+      # updates *for that one file* as it transfers, `\r`-separated so a
+      # real terminal overwrites them in place. `tr '\r' '\n'` turns each
+      # of those into its own line so `read` sees them as they arrive
+      # instead of blocking until rsync eventually emits a real newline
+      # (which only happens once the file is done) — this is what makes
+      # genuinely live, sub-file, mid-transfer progress possible at all.
+      #
+      # Two event types go to PROGRESS_EVENTS_FIFO, both tagged with this
+      # worker's tag so the single progress-phase reader can attribute
+      # them to the right row:
+      #   F <wtag> <name> <total_bytes> <action> <type>  — this worker just
+      #        started NAME ("NEW" or "UPD"); TYPE is what kind of object
+      #        it is (FILE/DIR/LNK/DEV/SPEC/OBJ), from rsync's own itemize
+      #        type character — the manifest of what's being synced covers
+      #        every object type rsync actually touches, not just files.
+      #   P <wtag> <bytes_so_far> <pct>   — progress on whatever object this
+      #                                     worker most recently started
+      cur_name=""
+      while IFS= read -r line; do
+        printf '%s\n' "$line" >> "$worker_log"
+        if [[ "$line" == *'|'* ]]; then
+          IFS='|' read -r itemized bytes name <<<"$line"
+          # rsync's itemize type character (position 1 of %i): f=file,
+          # d=directory, L=symlink, D=device, S=special. Anything else
+          # non-space/non-empty still gets tracked, generically, as "OBJ"
+          # rather than silently skipped.
+          case "${itemized:1:1}" in
+            f) obj_type="FILE" ;;
+            d) obj_type="DIR" ;;
+            L) obj_type="LNK" ;;
+            D) obj_type="DEV" ;;
+            S) obj_type="SPEC" ;;
+            ""|" ") obj_type="" ;;
+            *) obj_type="OBJ" ;;
+          esac
+          if [[ -n "${itemized:-}" && -n "$obj_type" && -n "${name:-}" ]]; then
+            cur_name="$name"
+            if [[ -n "${PROGRESS_EVENTS_FIFO:-}" && -p "$PROGRESS_EVENTS_FIFO" ]]; then
+              # rsync's itemize code: an entirely new object is "+" all the
+              # way through from position 2 on (e.g. ">f+++++++++"); an
+              # existing one being updated shows which attributes changed
+              # instead (e.g. ">f.st......"). That third character alone
+              # reliably tells the two apart, for any object type.
+              action="UPD"; [[ "${itemized:2:1}" == "+" ]] && action="NEW"
+              printf 'F\t%s\t%s\t%s\t%s\t%s\n' "$wtag" "$cur_name" "${bytes:-0}" "$action" "$obj_type" >> "$PROGRESS_EVENTS_FIFO" 2>/dev/null || true
+              # Only regular files stream incremental `\r` progress lines
+              # after this; a directory/symlink/etc. is done the instant
+              # rsync itemizes it, so report that immediately rather than
+              # waiting for percentage lines that will never come.
+              if [[ "$obj_type" != "FILE" ]]; then
+                printf 'P\t%s\t%s\t100\n' "$wtag" "${bytes:-0}" >> "$PROGRESS_EVENTS_FIFO" 2>/dev/null || true
+              fi
+            fi
+          fi
+        elif [[ -n "$cur_name" && "$line" =~ ^[[:space:]]*([0-9][0-9,]*)[[:space:]]+([0-9]+)% ]]; then
+          if [[ -n "${PROGRESS_EVENTS_FIFO:-}" && -p "$PROGRESS_EVENTS_FIFO" ]]; then
+            printf 'P\t%s\t%s\t%s\n' "$wtag" "${BASH_REMATCH[1]//,/}" "${BASH_REMATCH[2]}" >> "$PROGRESS_EVENTS_FIFO" 2>/dev/null || true
           fi
         fi
       done
-      if [[ "$pending_bytes" -gt 0 && -n "${PROGRESS_FIFO:-}" && -p "$PROGRESS_FIFO" ]]; then
-        head -c "$pending_bytes" /dev/zero >> "$PROGRESS_FIFO" 2>/dev/null || true
-      fi
     }
     rsync_exit="${PIPESTATUS[0]}"
     set -e
@@ -532,7 +590,7 @@ info "SSH:    ${DEST_USER}@${DEST_HOST} port ${SSH_PORT}"
 # Preflight: required tools
 # ---------------------------------------------------------------------------
 MISSING=()
-for bin in rsync ssh pv find split xargs awk stdbuf grep python3; do
+for bin in rsync ssh find split xargs awk stdbuf grep python3; do
   command -v "$bin" >/dev/null 2>&1 || MISSING+=("$bin")
 done
 if [[ ${#MISSING[@]} -gt 0 ]]; then
@@ -543,7 +601,11 @@ if ! python3 -c 'import yaml' >/dev/null 2>&1; then
   fail "python3's PyYAML module is required (pip install pyyaml / apt install python3-yaml) but is not available."
   exit 1
 fi
-ok "All required tools present (rsync, ssh, pv, find, split, xargs, awk, stdbuf, grep, python3+PyYAML)"
+if ! python3 -c 'import tqdm' >/dev/null 2>&1; then
+  fail "python3's tqdm module is required (pip install tqdm / apt install python3-tqdm) but is not available."
+  exit 1
+fi
+ok "All required tools present (rsync, ssh, find, split, xargs, awk, stdbuf, grep, python3+PyYAML+tqdm)"
 
 # ---------------------------------------------------------------------------
 # Preflight: SSH connectivity + remote destination directory
@@ -572,12 +634,19 @@ if [[ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Build file list: regular files, directories (incl. empty), and symlinks,
+# Build file lists: regular files, directories (incl. empty), and symlinks,
 # so new files AND new/empty directories are always replicated. Captures
 # mtime too, so the destination comparison below can tell which files are
 # actually new/changed versus already in sync.
+#
+# The local (SRC_DIR) scan and the remote (DEST_DIR, over SSH) scan are
+# fully independent of each other until the diff step below, and the remote
+# one is a full SSH round-trip over the tree — so they're run concurrently
+# as two background jobs and joined with `wait`, rather than paying that
+# round-trip latency serially after the local scan already finished.
 # ---------------------------------------------------------------------------
-info "Scanning source tree ..."
+info "Scanning source and destination trees (concurrently) ..."
+
 # Build a find-native prune clause from EXCLUDE_PATTERNS (already normalized
 # to "name:VALUE" / "path:VALUE" by load_exclude_patterns) as a bash array
 # (no string interpolation, no quoting risk).
@@ -593,47 +662,6 @@ if [[ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]]; then
     first=0
   done
 fi
-
-read -r TOTAL_FILES TOTAL_DIRS TOTAL_LINKS TOTAL_BYTES < <(
-  if [[ ${#LOCAL_PRUNE_ARGS[@]} -gt 0 ]]; then
-    find "$SRC_DIR" -mindepth 1 \( "${LOCAL_PRUNE_ARGS[@]}" \) -prune -o \( -type f -o -type d -o -type l \) -printf '%y\t%s\t%T@\t%P\n'
-  else
-    find "$SRC_DIR" -mindepth 1 -printf '%y\t%s\t%T@\t%P\n'
-  fi | awk -F'\t' -v files_txt="$FILES_TXT" -v listing="$SRC_LISTING" '
-    {
-      type = $1; size = $2; mtime = $3; path = $4
-      for (i = 5; i <= NF; i++) path = path "\t" $i
-      if (type == "f" || type == "d" || type == "l") {
-        print path > files_txt
-        print type"\t"size"\t"mtime"\t"path > listing
-        if (type == "f") { files++; bytes += size }
-        else if (type == "d") dirs++
-        else if (type == "l") links++
-      }
-    }
-    END { printf "%d %d %d %d\n", files+0, dirs+0, links+0, bytes+0 }
-  '
-)
-TOTAL_ENTRIES="$(wc -l < "$FILES_TXT")"
-
-info "Entries to sync: $TOTAL_ENTRIES  (files: $TOTAL_FILES, dirs: $TOTAL_DIRS, symlinks: $TOTAL_LINKS)"
-info "Total data size: $(human_size "$TOTAL_BYTES")"
-
-# ---------------------------------------------------------------------------
-# Scan the destination too, up front — so we know everything that needs to
-# change (what SRC has that DEST doesn't yet reflect, AND what DEST has
-# that SRC no longer does) before anything starts. This lets the progress
-# bar only appear when there's real work, sized to the real amount of
-# work, and lets us name exactly what's being added/updated or removed.
-# "Added/updated" is decided the same way rsync's own default quick-check
-# does: new to DEST, or size/mtime differs.
-# ---------------------------------------------------------------------------
-info "Scanning destination tree ..."
-ADD_COUNT=0
-ADD_BYTES=0
-EXTRANEOUS_COUNT=0
-REMOVE_BYTES=0
-DEST_SCAN_OK=0
 
 # Same prune logic as the local scan, but built as an argv array and quoted
 # in one pass (printf -v ... '%q ') rather than hand-escaped, since this has
@@ -659,12 +687,70 @@ fi
 REMOTE_FIND_ARGV+=("(" -type f -o -type d -o -type l ")" -printf '%y\t%s\t%T@\t%P\n')
 printf -v REMOTE_FIND_CMD '%q ' "${REMOTE_FIND_ARGV[@]}"
 
-# shellcheck disable=SC2086
-if ssh -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=15 \
-     -o StrictHostKeyChecking=accept-new $SSH_CTL_OPTS "${DEST_USER}@${DEST_HOST}" \
-     "$REMOTE_FIND_CMD" \
-     > "$DEST_LISTING" 2>>"$ERR_LOG"; then
-  DEST_SCAN_OK=1
+(
+  if [[ ${#LOCAL_PRUNE_ARGS[@]} -gt 0 ]]; then
+    find "$SRC_DIR" -mindepth 1 \( "${LOCAL_PRUNE_ARGS[@]}" \) -prune -o \( -type f -o -type d -o -type l \) -printf '%y\t%s\t%T@\t%P\n'
+  else
+    find "$SRC_DIR" -mindepth 1 -printf '%y\t%s\t%T@\t%P\n'
+  fi | awk -F'\t' -v files_txt="$FILES_TXT" -v listing="$SRC_LISTING" '
+    {
+      type = $1; size = $2; mtime = $3; path = $4
+      for (i = 5; i <= NF; i++) path = path "\t" $i
+      if (type == "f" || type == "d" || type == "l") {
+        print path > files_txt
+        print type"\t"size"\t"mtime"\t"path > listing
+        if (type == "f") { files++; bytes += size }
+        else if (type == "d") dirs++
+        else if (type == "l") links++
+      }
+    }
+    END { printf "%d %d %d %d\n", files+0, dirs+0, links+0, bytes+0 }
+  ' > "$LOCAL_SCAN_RESULT"
+) &
+LOCAL_SCAN_PID=$!
+
+(
+  # shellcheck disable=SC2086
+  if ssh -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=15 \
+       -o StrictHostKeyChecking=accept-new $SSH_CTL_OPTS "${DEST_USER}@${DEST_HOST}" \
+       "$REMOTE_FIND_CMD" \
+       > "$DEST_LISTING" 2>>"$ERR_LOG"; then
+    echo 0 > "$DEST_SCAN_EXIT_FILE"
+  else
+    echo 1 > "$DEST_SCAN_EXIT_FILE"
+  fi
+) &
+DEST_SCAN_PID=$!
+
+wait "$LOCAL_SCAN_PID"
+wait "$DEST_SCAN_PID"
+
+read -r TOTAL_FILES TOTAL_DIRS TOTAL_LINKS TOTAL_BYTES < "$LOCAL_SCAN_RESULT"
+rm -f "$LOCAL_SCAN_RESULT"
+TOTAL_ENTRIES="$(wc -l < "$FILES_TXT")"
+
+info "Entries to sync: $TOTAL_ENTRIES  (files: $TOTAL_FILES, dirs: $TOTAL_DIRS, symlinks: $TOTAL_LINKS)"
+info "Total data size: $(human_size "$TOTAL_BYTES")"
+
+# ---------------------------------------------------------------------------
+# Diff source vs. destination — now that both scans (run concurrently above)
+# have completed — so we know everything that needs to change (what SRC has
+# that DEST doesn't yet reflect, AND what DEST has that SRC no longer does)
+# before anything starts. This lets the progress bar only appear when
+# there's real work, sized to the real amount of work, and lets us name
+# exactly what's being added/updated or removed. "Added/updated" is decided
+# the same way rsync's own default quick-check does: new to DEST, or
+# size/mtime differs.
+# ---------------------------------------------------------------------------
+ADD_COUNT=0
+ADD_BYTES=0
+EXTRANEOUS_COUNT=0
+REMOVE_BYTES=0
+DEST_SCAN_OK=0
+[[ "$(cat "$DEST_SCAN_EXIT_FILE" 2>/dev/null)" == "0" ]] && DEST_SCAN_OK=1
+rm -f "$DEST_SCAN_EXIT_FILE"
+
+if [[ "$DEST_SCAN_OK" -eq 1 ]]; then
   read -r ADD_COUNT ADD_BYTES EXTRANEOUS_COUNT REMOVE_BYTES < <(
     awk -F'\t' -v addfile="$ADD_FULL" -v remfile="$EXTRANEOUS_FULL" '
       function rejoin(startidx,   p, i) {
@@ -765,42 +851,325 @@ banner "Replication Propagation: $SRC_DIR  →  ${DEST_USER}@${DEST_HOST}:${DEST
 info "Running parallel rsync with JOBS=$JOBS ..."
 
 # ---------------------------------------------------------------------------
-# Live aggregate progress bar (PV): only shown when something is actually
-# changing (an addition or a removal was detected above). One bar spans
-# BOTH — additions feed it during the transfer below, removals feed it
-# later once the transfer has succeeded — sized to the combined bytes of
-# everything that will actually change this run.
+# Live per-item progress: one phase for the upload/update transfer below, a
+# separate one for removal propagation further down (each labeled and sized
+# to its own byte total, rather than one ambiguous bar for both). Every
+# file/object gets its own real, colored, 0-100% tqdm bar while it's
+# transferring; the instant it finishes, that bar is replaced by a
+# permanent, colored, one-line completion record via `tqdm.write()` — so a
+# screenshot or terminal copy/paste taken any time after the run (which only
+# ever shows current screen contents, not the history of frames that
+# scrolled past) still shows every individual file/object that was acted on,
+# not just the aggregate.
+#
+# A handful of live bar *positions* (capped at PROGRESS_MAX_SLOTS) are
+# reused across the run — tqdm's `position=` mechanism is only reliable for
+# a small, stable set of concurrently-live rows; closing several
+# `leave=True` position-based bars over the course of a run (one new
+# permanent row per file) turns out to corrupt tqdm's own cursor bookkeeping
+# (verified empirically: trailing garbage character runs and, in one case,
+# a line printed in the wrong place entirely). `tqdm.write()` is the
+# actually-supported way to interleave permanent lines with live bars — it
+# temporarily clears the active bars, writes a normal scrolled line above
+# them, and redraws them — so the permanent record goes through that
+# instead of through a second wave of position-based bars.
+#
+# This used to run `pv` as an independent background process for the bar,
+# with a second reader process drawing a status line underneath it via
+# cursor save/restore tricks. In practice two uncoordinated processes both
+# writing live-updating escape sequences to the same terminal cannot be made
+# reliably race-free that way: the two writes occasionally interleaved badly
+# enough that `pv` lost track of its own row and started a fresh line
+# instead of overwriting it, producing duplicate/stacked bars. The fix kept
+# here is to have exactly one process own the terminal: a single Python
+# reader (using tqdm) computes/draws everything itself from the same
+# byte-count events workers already emit. There's nothing else writing to
+# the terminal to race with. Both phases are fully finished and closed
+# before the Summary section prints, further down.
 # ---------------------------------------------------------------------------
-COMBINED_BYTES=$(( ADD_BYTES + REMOVE_BYTES ))
-PV_PID=""
-PROGRESS_FD=""
-if [[ "$COMBINED_BYTES" -gt 0 && ( "$ADD_COUNT" -gt 0 || "$EXTRANEOUS_COUNT" -gt 0 ) ]]; then
-  mkfifo "$PROGRESS_FIFO"
-  pv -s "$COMBINED_BYTES" -N "Replication progress" -petr < "$PROGRESS_FIFO" > /dev/null &
-  PV_PID=$!
-  exec {PROGRESS_FD}>"$PROGRESS_FIFO"
-else
-  ok "Nothing to add or remove — destination already matches source, no progress bar needed."
-  PROGRESS_FIFO=""
-fi
+PROGRESS_EVENTS_FD=""
+PROGRESS_READER_PID=""
 
-close_progress_bar() {
-  if [[ -n "$PROGRESS_FD" ]]; then
-    exec {PROGRESS_FD}>&-
-    PROGRESS_FD=""
-  fi
-  if [[ -n "$PV_PID" ]]; then
-    wait "$PV_PID" 2>/dev/null || true
-    PV_PID=""
-  fi
+start_progress_phase() {
+  local label="$1" total_bytes="$2" n_slots="${3:-1}"
+  [[ "$total_bytes" -gt 0 ]] || return 1
+  [[ "$n_slots" -ge 1 ]] || n_slots=1
+  [[ "$n_slots" -gt "$PROGRESS_MAX_SLOTS" ]] && n_slots="$PROGRESS_MAX_SLOTS"
+
+  # No live display at all when stderr isn't a terminal (redirected to a
+  # file, piped, etc.) — nothing to draw to, and nothing here writes
+  # PROGRESS_EVENTS_FIFO in that case (worker's own `-p` check on it will
+  # simply be false, so it skips the write, no blocking).
+  [[ -t 2 ]] || return 1
+
+  mkfifo "$PROGRESS_EVENTS_FIFO"
+
+  # Renderer is Python + tqdm rather than hand-rolled ANSI: tqdm draws each
+  # live bar at its own fixed terminal row via `position=`. The FIFO path is
+  # passed as argv (not piped via stdin) because stdin is already the
+  # heredoc; the script opens it itself with open(), which blocks until the
+  # write end below is opened — same reader-starts-first handshake the old
+  # `exec 4< "$PROGRESS_EVENTS_FIFO"` relied on.
+  python3 - "$PROGRESS_EVENTS_FIFO" "$label" "$total_bytes" "$n_slots" <<'PYEOF' &
+import shutil, sys, time
+from tqdm import tqdm
+
+fifo_path, label, total_bytes, n_slots = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+
+# tqdm's own format_meter() silently discards the entire custom bar_format
+# below (falling back to its plain built-in one) whenever it resolves the
+# terminal width to exactly 0 columns — which some environments report
+# (certain multiplexers/log wrappers, or a pty with a not-yet-populated
+# window size). Passing an explicit, guaranteed-nonzero width sidesteps
+# that codepath entirely, so the richer formatting below is never silently
+# dropped.
+NCOLS = shutil.get_terminal_size(fallback=(120, 24)).columns or 120
+
+# ANSI SGR codes for the permanent completion line, keyed by action type
+# (what kind of change this object was).
+COLOR = {"NEW": "32", "UPD": "36", "DEL": "31"}
+
+# While a bar is still live (actually transferring), its fill colour
+# progresses with how far along it is — vivid red early, amber through the
+# middle, vivid green as it nears done — rather than a single static color,
+# so a glance at the bar's own color says roughly how far along it is
+# without having to read the percentage. Hex (truecolor) rather than one of
+# tqdm's 8 basic named colours, since basic ANSI red/green tend to render
+# dim/washed-out on many terminal themes.
+def pct_colour(pct):
+    if pct < 34:
+        return "#ff3b30"
+    if pct < 67:
+        return "#ffcc00"
+    return "#34c759"
+
+# Small, bounded pool of live-bar row positions, reused across the run —
+# keyed by worker tag (wtag), which is only a routing key for this worker's
+# byte-progress (P) events; the bar itself always reflects whichever real
+# object that worker is currently syncing — file, directory, symlink, or
+# anything else rsync itemizes: reuse the row a wtag already owns, else an
+# unused row, else steal the least-recently-updated row (its occupant is
+# finished — freeze+log it first).
+slot_wtag = [None] * n_slots
+slot_bar = [None] * n_slots
+slot_name = [None] * n_slots
+slot_action = [None] * n_slots
+slot_type = [None] * n_slots
+slot_counts = [False] * n_slots  # only FILE objects have real transferred bytes
+slot_seq = [0] * n_slots
+slot_open_at = [0.0] * n_slots
+seq = 0
+committed_bytes = 0
+
+# A file small/fast enough to transfer within a single throttle tick would
+# otherwise go from "doesn't exist" straight to "permanent completion
+# line" with no live bar ever actually rendered in between — which is
+# exactly what a live bar is for. Holding each slot open for at least this
+# long guarantees every file's live, colored bar is on screen long enough
+# to actually be seen before it's replaced.
+#
+# This is a display-side wait in this single reader process, not the
+# actual worker/rsync — but the reader is also the only thing draining
+# PROGRESS_EVENTS_FIFO, and a named pipe's kernel buffer is finite: if this
+# wait fell far enough behind, a worker's own writes to the FIFO would
+# eventually block on a full buffer, which *would* stall real transfer
+# work. VISIBLE_BUDGET_S bounds the total cosmetic delay this can ever add
+# across a whole phase, so a run with hundreds of small files can't turn a
+# per-file half-second UX nicety into a cumulative multi-minute stall —
+# once the budget is spent, files still get their guaranteed first frame
+# (the unthrottled refresh right after each bar opens, below) but no
+# longer get held open past it.
+MIN_VISIBLE_S = 0.35
+VISIBLE_BUDGET_S = 3.0
+visible_budget = VISIBLE_BUDGET_S
+
+# Positioned *below* every live per-object row (position=n_slots, the
+# largest position number = the bottom-most row) so the aggregate always
+# renders as the last line of the block for the whole phase, not just
+# after every object has finished and closed — the manifest of individual
+# objects sits above it throughout.
+#
+# leave=False, not True: tqdm's own close() hardcodes `self.display(pos=0)`
+# for a `leave=True` bar (verified by reading its source) — it assumes a
+# left-behind bar is always the outer/root bar at position 0. With the
+# aggregate now at position=n_slots instead, that hardcoded call writes its
+# final frame at the wrong row, corrupting the block (verified empirically:
+# a duplicated frame and a garbled banner line right after). Sidestep it
+# entirely the same way per-object completions already do: close ephemeral
+# (leave=False, the safe codepath, which does use the real position) and
+# hand-write the permanent final line via tqdm.write() once every other bar
+# in the phase is already closed — see the `finally` block below.
+overall = tqdm(total=total_bytes, desc=label, position=n_slots, leave=False, ncols=NCOLS,
+                unit="B", unit_scale=True, unit_divisor=1024, file=sys.stderr, colour=pct_colour(0),
+                bar_format="\x1b[1m{desc} TOTAL\x1b[0m: {percentage:3.0f}%|{bar}| "
+                           "{n_fmt}/{total_fmt}  {rate_fmt}  elapsed {elapsed}")
+
+def slot_for(wtag):
+    for i in range(n_slots):
+        if slot_wtag[i] == wtag:
+            return i
+    for i in range(n_slots):
+        if slot_wtag[i] is None:
+            return i
+    return min(range(n_slots), key=lambda i: slot_seq[i])
+
+def finish_slot(i):
+    global committed_bytes, visible_budget
+    bar = slot_bar[i]
+    if bar is not None:
+        remaining = MIN_VISIBLE_S - (time.monotonic() - slot_open_at[i])
+        if remaining > 0 and visible_budget > 0:
+            wait = min(remaining, visible_budget)
+            time.sleep(wait)
+            visible_budget -= wait
+        bar.n = bar.total
+        bar.colour = pct_colour(100)
+        bar.refresh()
+        fd = bar.format_dict  # snapshot elapsed/rate before close() tears the bar down
+        bar.close()  # leave=False: clears this row cleanly, no residue
+        sgr = COLOR.get(slot_action[i], "36")
+        size_str = tqdm.format_sizeof(bar.total, suffix="B", divisor=1024)
+        elapsed_str = tqdm.format_interval(fd["elapsed"])
+        rate = fd["rate"] or (bar.total / fd["elapsed"] if fd["elapsed"] else 0)
+        rate_str = tqdm.format_sizeof(rate, suffix="B/s", divisor=1024)
+        tqdm.write(f"\x1b[1;{sgr}m✓ {slot_action[i]:<3}\x1b[0m {slot_type[i]:<4} {slot_name[i]}  "
+                   f"100%  {size_str}  in {elapsed_str}  avg {rate_str}", file=sys.stderr)
+        # Only real file bytes were ever budgeted into total_bytes (see
+        # ADD_BYTES/REMOVE_BYTES upstream, which sum file sizes only) — a
+        # directory/symlink/etc.'s own size folded in here would let the
+        # aggregate reach 100% before every object is actually finished.
+        if slot_counts[i]:
+            committed_bytes += bar.total
+    slot_wtag[i] = None
+    slot_bar[i] = None
+    slot_name[i] = None
+    slot_action[i] = None
+    slot_type[i] = None
+    slot_counts[i] = False
+
+def active_bytes():
+    return sum(b.n for i, b in enumerate(slot_bar) if b is not None and slot_counts[i])
+
+def refresh_overall():
+    overall.n = min(committed_bytes + active_bytes(), total_bytes)
+    overall.colour = pct_colour(overall.n * 100 / total_bytes if total_bytes else 100)
+    overall.refresh()
+
+last_tick = -1
+try:
+    with open(fifo_path, "r") as fifo:
+        for line in fifo:
+            parts = line.rstrip("\n").split("\t")
+            ev_type = parts[0]
+            if ev_type == "F" and len(parts) >= 6:
+                _, wtag, name, size, action, obj_type = parts[:6]
+                i = slot_for(wtag)
+                finish_slot(i)  # previous occupant of this row (if any) is done
+                slot_wtag[i] = wtag
+                slot_name[i] = name
+                slot_action[i] = action
+                slot_type[i] = obj_type
+                slot_counts[i] = (obj_type == "FILE")
+                # A zero-byte object (an empty directory, say) would make
+                # `total` falsy, and tqdm's percentage math is skipped
+                # entirely when total is falsy — clamp to a nominal 1 so
+                # the bar/percentage always render normally, 0% -> 100%.
+                slot_bar[i] = tqdm(total=max(int(size or 0), 1), desc=f"\x1b[1m{action:<3}\x1b[0m {obj_type:<4} {name}",
+                                    position=i, leave=False, ncols=NCOLS, unit="B", unit_scale=True,
+                                    unit_divisor=1024, file=sys.stderr, colour=pct_colour(0),
+                                    bar_format="  {desc:.75}  {percentage:3.0f}%|{bar}| "
+                                               "{n_fmt}/{total_fmt}  {rate_fmt}  "
+                                               "elapsed {elapsed} ETA {remaining}")
+                slot_open_at[i] = time.monotonic()
+                slot_bar[i].refresh()  # unthrottled: guarantees a visible first frame even for a file that finishes within one tick
+                seq += 1; slot_seq[i] = seq
+            elif ev_type == "P" and len(parts) >= 3:
+                _, wtag, bytes_so_far = parts[:3]
+                i = slot_for(wtag)
+                if slot_bar[i] is None:
+                    continue
+                slot_bar[i].n = min(int(bytes_so_far or 0), slot_bar[i].total)
+                seq += 1; slot_seq[i] = seq
+            else:
+                continue
+
+            # Throttled to ~4/sec so bars still look genuinely live without
+            # redrawing on every single event — a busy run can emit many
+            # progress events per second.
+            tick = int(time.monotonic() * 4)
+            if tick == last_tick:
+                continue
+            last_tick = tick
+            for b in slot_bar:
+                if b is not None:
+                    b.colour = pct_colour(b.n * 100 / b.total if b.total else 100)
+                    b.refresh()
+            refresh_overall()
+finally:
+    for i in range(n_slots):
+        finish_slot(i)
+    overall.n = total_bytes
+    overall.colour = pct_colour(100)
+    overall.refresh()
+    fd = overall.format_dict
+    # By this point overall is the only bar left registered, so its own
+    # close() (leave=False) clears via display(msg='', pos=pos) directly
+    # rather than going through clear() — and unlike clear(), that path
+    # doesn't write a trailing \r to reset the cursor column afterward, so
+    # the next write would otherwise land indented by however wide the
+    # last live frame was. The leading \r below is that same reset.
+    overall.close()
+    size_str = tqdm.format_sizeof(total_bytes, suffix="B", divisor=1024)
+    elapsed_str = tqdm.format_interval(fd["elapsed"])
+    rate = fd["rate"] or (total_bytes / fd["elapsed"] if fd["elapsed"] else 0)
+    rate_str = tqdm.format_sizeof(rate, suffix="B/s", divisor=1024)
+    tqdm.write(f"\r\x1b[1m{label} TOTAL\x1b[0m: 100%  {size_str}  {rate_str}  elapsed {elapsed_str}",
+               file=sys.stderr)
+PYEOF
+  PROGRESS_READER_PID=$!
+
+  exec {PROGRESS_EVENTS_FD}>"$PROGRESS_EVENTS_FIFO"
+  return 0
 }
+
+close_progress_phase() {
+  if [[ -n "$PROGRESS_EVENTS_FD" ]]; then
+    exec {PROGRESS_EVENTS_FD}>&-
+    PROGRESS_EVENTS_FD=""
+  fi
+  if [[ -n "$PROGRESS_READER_PID" ]]; then
+    wait "$PROGRESS_READER_PID" 2>/dev/null || true
+    PROGRESS_READER_PID=""
+  fi
+  # PROGRESS_EVENTS_FIFO is a fixed path (set once, near the top of the
+  # script) reused across both phases — only the FIFO file itself is
+  # removed here, not the path variable, so start_progress_phase can
+  # mkfifo the same path again for the next phase.
+  rm -f "$PROGRESS_EVENTS_FIFO" 2>/dev/null || true
+}
+
+if [[ "$ADD_COUNT" -eq 0 && "$EXTRANEOUS_COUNT" -eq 0 ]]; then
+  ok "Nothing to add or remove — destination already matches source, no progress bar needed."
+fi
 
 # Arrays can't cross the export/xargs-bash-c boundary, so serialize once as
 # a newline-joined scalar; each element is guaranteed single-line already
 # (it came from `read -r` over the exclude file), so this round-trips safely.
 EXCLUDE_PATTERNS_JOINED="$(printf '%s\n' "${EXCLUDE_PATTERNS[@]-}")"
 
-export SRC_DIR DEST_USER DEST_HOST SSH_PORT TMP RUN_TS LOG ERR_LOG FAIL_MARKERS_DIR SUMMARY_TXT DEST_DIR PROGRESS_FIFO SSH_CTL_OPTS EXCLUDE_PATTERNS_JOINED
+export SRC_DIR DEST_USER DEST_HOST SSH_PORT TMP RUN_TS LOG ERR_LOG FAIL_MARKERS_DIR SUMMARY_TXT DEST_DIR PROGRESS_EVENTS_FIFO SSH_CTL_OPTS EXCLUDE_PATTERNS_JOINED
+
+# "Uploading" phase: aggregate bar + a live bar per file actually in flight
+# (each leaving a permanent completion line behind it), sized to what the
+# destination diff found needs adding/updating.
+UPLOAD_SLOTS="$JOBS"
+[[ "$CHUNKS" -lt "$UPLOAD_SLOTS" ]] && UPLOAD_SLOTS="$CHUNKS"
+# CHUNKS is sized off the *whole* tree (so every rsync quick-check runs),
+# not off how many items the diff actually found changed — most chunks on
+# an incremental run transfer nothing at all. Capping slots at ADD_COUNT
+# too avoids reserving rows that will just sit idle the entire run.
+[[ "$ADD_COUNT" -gt 0 && "$ADD_COUNT" -lt "$UPLOAD_SLOTS" ]] && UPLOAD_SLOTS="$ADD_COUNT"
+start_progress_phase "Syncing" "$ADD_BYTES" "$UPLOAD_SLOTS" || true
 
 # shellcheck disable=SC2016 # single-quoted on purpose: $1/$DEST_DIR must expand in the xargs-spawned subshell, not here
 if [[ "$CHUNKS" -gt 0 ]]; then
@@ -808,8 +1177,11 @@ if [[ "$CHUNKS" -gt 0 ]]; then
   xargs -0 -n1 -P "$JOBS" bash -c 'worker "$1" "$DEST_DIR"' _ || true
 fi
 
-# NOTE: the progress FIFO/PV stay open here — propagation (removals,
-# below) still has to feed the same bar before it's closed out.
+# Upload phase's bar/current-item line is done once the workers are — fully
+# finished and closed here, well before anything else prints, rather than
+# staying live across later output (that's what used to make the pv line
+# and the Summary text interleave on screen).
+close_progress_phase
 
 echo
 FAILS="$(find "$FAIL_MARKERS_DIR" -type f 2>/dev/null | wc -l)"
@@ -845,6 +1217,72 @@ if command -v column >/dev/null 2>&1; then
     && mv "${SUMMARY_TXT}.aligned" "$SUMMARY_TXT"
 fi
 
+if [[ "$FAILS" -gt 0 ]]; then
+  # A partial/failed transfer never triggers deletions — the extraneous-item
+  # removal below only ever runs after a fully successful transfer.
+  DELETE_EXIT=""
+else
+  # -------------------------------------------------------------------------
+  # Replication propagation, part two: remove from DEST anything no longer
+  # present in SRC. Uses the extraneous list computed up front (before the
+  # transfer even started — see the destination scan above), so it always
+  # has complete context regardless of how the transfer was chunked. Its own
+  # "Removing" bar + current-item line (separate from the "Uploading" one
+  # above) is fully closed before the Summary section below prints.
+  # -------------------------------------------------------------------------
+  start_progress_phase "Syncing" "$REMOVE_BYTES" || true
+
+  if [[ "$DEST_SCAN_OK" -eq 1 && "$EXTRANEOUS_COUNT" -gt 0 ]]; then
+    set +e
+    # shellcheck disable=SC2086
+    # shellcheck disable=SC2094 # false positive: EXTRANEOUS_FULL is fully written earlier and only ever read here (twice, not written)
+    cut -f3 "$EXTRANEOUS_FULL" | tr '\n' '\0' |
+      ssh -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=15 \
+        -o StrictHostKeyChecking=accept-new $SSH_CTL_OPTS "${DEST_USER}@${DEST_HOST}" \
+        "cd $(printf '%q' "$DEST_DIR") && fail=0; while IFS= read -r -d '' item; do rm -rf -- \"\$item\" || fail=1; echo; done; exit \$fail" \
+        2>>"$ERR_LOG" |
+      {
+        # One completion line arrives per removed item, in the same order
+        # they were sent — pair it with that item's real name/size (read in
+        # lockstep from fd 3) and feed it to the Removing phase's single
+        # row as an F+P pair (removal has no partial/sub-item progress of
+        # its own — `rm` is atomic — so each item is reported as starting
+        # and finishing in the same breath, same F/P protocol as uploads).
+        while IFS= read -r _; do
+          IFS=$'\t' read -r -u 3 item_type item_size item_name || break
+          # find's -printf '%y' (used to build EXTRANEOUS_FULL) only ever
+          # emits f/d/l for this script's find invocation.
+          obj_type=""
+          case "$item_type" in
+            f) obj_type="FILE" ;;
+            d) obj_type="DIR" ;;
+            l) obj_type="LNK" ;;
+          esac
+          if [[ -n "$obj_type" && -n "${PROGRESS_EVENTS_FIFO:-}" && -p "$PROGRESS_EVENTS_FIFO" ]]; then
+            printf 'F\tR\t%s\t%s\tDEL\t%s\n' "$item_name" "$item_size" "$obj_type" >> "$PROGRESS_EVENTS_FIFO" 2>/dev/null || true
+            printf 'P\tR\t%s\t100\n' "$item_size" >> "$PROGRESS_EVENTS_FIFO" 2>/dev/null || true
+          fi
+        done
+      } 3< "$EXTRANEOUS_FULL"
+    DELETE_EXIT="${PIPESTATUS[2]}"
+    set -e
+  else
+    DELETE_EXIT=0
+  fi
+
+  close_progress_phase
+fi
+# SRC_LISTING/DEST_LISTING/ADD_FULL/EXTRANEOUS_FULL are cleaned up
+# unconditionally by cleanup() (the EXIT trap), not here — that way they're
+# removed on every exit path, including early failures, not just this one.
+
+# ---------------------------------------------------------------------------
+# Unified summary: printed only after both progress phases (Uploading,
+# Removing) are fully closed, so nothing here interleaves with a still-live
+# pv line — this was previously split across a mid-run "Summary" banner and
+# a separate block after deletion, with the pv bar still writing to the
+# terminal in between.
+# ---------------------------------------------------------------------------
 banner "Summary"
 info "Completed: $(date)"
 info "Chunks:    $CHUNKS"
@@ -862,45 +1300,12 @@ else
 fi
 
 if [[ "$FAILS" -gt 0 ]]; then
-  close_progress_bar
   fail "One or more chunks failed to replicate. Review the error log below."
   printf '%s\n' "Error log: $ERR_LOG"
   exit 2
 fi
 
-# ---------------------------------------------------------------------------
-# Replication propagation, part two: remove from DEST anything no longer
-# present in SRC. Uses the extraneous list computed up front (before the
-# transfer even started — see the destination scan above), so it always
-# has complete context regardless of how the transfer was chunked. Only
-# runs after a fully successful transfer, so a partial/failed run never
-# triggers deletions. Feeds the same shared progress bar as the additions
-# above, using each item's real size (already known from that scan).
-# ---------------------------------------------------------------------------
 if [[ "$DEST_SCAN_OK" -eq 1 && "$EXTRANEOUS_COUNT" -gt 0 ]]; then
-  set +e
-  # shellcheck disable=SC2086
-  # shellcheck disable=SC2094 # false positive: EXTRANEOUS_FULL is fully written earlier and only ever read here (twice, not written)
-  cut -f3 "$EXTRANEOUS_FULL" | tr '\n' '\0' |
-    ssh -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=15 \
-      -o StrictHostKeyChecking=accept-new $SSH_CTL_OPTS "${DEST_USER}@${DEST_HOST}" \
-      "cd $(printf '%q' "$DEST_DIR") && fail=0; while IFS= read -r -d '' item; do rm -rf -- \"\$item\" || fail=1; echo; done; exit \$fail" \
-      2>>"$ERR_LOG" |
-    {
-      # One completion line arrives per removed item, in the same order
-      # they were sent — pair it with that item's real size (read in
-      # lockstep from fd 3) and feed it into the same shared bar as the
-      # additions above, so one bar spans both kinds of change.
-      while IFS= read -r _; do
-        IFS=$'\t' read -r -u 3 item_type item_size _ || break
-        if [[ "$item_type" == "f" && -n "${PROGRESS_FIFO:-}" && -p "$PROGRESS_FIFO" ]]; then
-          head -c "$item_size" /dev/zero >> "$PROGRESS_FIFO" 2>/dev/null || true
-        fi
-      done
-    } 3< "$EXTRANEOUS_FULL"
-  DELETE_EXIT="${PIPESTATUS[2]}"
-  set -e
-
   if [[ "$DELETE_EXIT" -eq 0 ]]; then
     ok "Replication propagation complete: $EXTRANEOUS_COUNT item(s) removed."
   else
@@ -909,11 +1314,6 @@ if [[ "$DEST_SCAN_OK" -eq 1 && "$EXTRANEOUS_COUNT" -gt 0 ]]; then
 elif [[ "$DEST_SCAN_OK" -eq 1 ]]; then
   ok "Nothing to remove — destination matches source."
 fi
-# SRC_LISTING/DEST_LISTING/ADD_FULL/EXTRANEOUS_FULL are cleaned up
-# unconditionally by cleanup() (the EXIT trap), not here — that way they're
-# removed on every exit path, including early failures, not just this one.
-
-close_progress_bar
 
 TOTAL_CHANGED_BYTES="$(awk '/changed=1/ {for (i=1;i<=NF;i++) if ($i ~ /^transferred_bytes=/){split($i,a,"="); sum+=a[2]}} END{print sum+0}' "$LOG")"
 TOTAL_CHANGED_FILES="$(awk '/changed=1/ {for (i=1;i<=NF;i++) if ($i ~ /^files_transferred=/){split($i,a,"="); sum+=a[2]}} END{print sum+0}' "$LOG")"
@@ -930,3 +1330,8 @@ info "Items removed:       $EXTRANEOUS_COUNT  ($(human_size "$REMOVE_BYTES"))"
 echo
 info "Main log: $LOG"
 info "Summary:  $SUMMARY_TXT"
+
+if [[ "$DELETE_EXIT" -ne 0 ]]; then
+  fail "Deletion propagation failed — see error log: $ERR_LOG"
+  exit 3
+fi
